@@ -21,9 +21,14 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Enterprise Master Pipeline Orchestrator.
- * Coordinates the 3-stage partition pipeline (PDF Parsing -> Chunking -> Vector Ingestion),
- * enforces pipeline concurrency locking, durable checkpoints, live status monitoring,
- * and adaptive resource-aware execution.
+ * Coordinates the 3-stage partition pipeline:
+ * - Partition 1: PDF -> Markdown (via OS-aware parallel PDFBox 3.0.3 parser)
+ * - Partition 2: Markdown -> JSONL (via recursive bisection chunking)
+ * - Partition 3: JSONL -> ChromaDB Vector Store (via content-addressed deduplicated embeddings)
+ *
+ * Enforces strict Isolation Gates between partitions to prevent thread leakage,
+ * guarantee active heap reference severance, and monitor garbage collection convergence
+ * before spawning workers in the subsequent partition.
  */
 @Service
 public class RagPipelineOrchestrator {
@@ -63,7 +68,7 @@ public class RagPipelineOrchestrator {
     }
 
     /**
-     * Executes the full pipeline end-to-end with failure isolation, bounded memory, and checkpoint tracking.
+     * Executes the full pipeline end-to-end with strict isolation gates, bounded memory, and checkpoint tracking.
      */
     public PipelineExecutionReport runPipeline(String inputFolderPath) {
         if (!pipelineLock.tryLock()) {
@@ -90,28 +95,49 @@ public class RagPipelineOrchestrator {
         long afterVectorHeapMb;
 
         try {
-            // Stage 1: Zero-Copy Parallel PDF Parsing (Partition 1)
+            // ==================================================================
+            // STAGE 1: Zero-Copy Parallel PDF Parsing (Partition 1: PDF -> MD)
+            // ==================================================================
             log.info("[PIPELINE:{}] >>> PARTITION 1: Parallel PDF Ingestion to Markdown...", runId);
             parseSummary = parserService.parseAllPdfs(inputFolderPath);
-            afterParsingHeapMb = clearPartitionRam("Partition 1 (PDF Parsing)");
+
+            // ISOLATION GATE 1: Sever Partition 1 references, drain workers, and monitor GC convergence
+            afterParsingHeapMb = executeIsolationGate(
+                    "Partition 1 (PDF Parsing)",
+                    "Partition 2 (Chunking to JSONL)"
+            );
 
             updateStatus(runId, true, "CHUNK",
                     parseSummary.discovered(), parseSummary.processed(), parseSummary.failed(),
                     parseSummary.totalPages(), 0, 0, pipelineStart.toEpochMilli());
 
-            // Stage 2: Parallel Stream Chunking (Partition 2)
+            // ==================================================================
+            // STAGE 2: Parallel Stream Chunking (Partition 2: MD -> JSONL)
+            // ==================================================================
             log.info("[PIPELINE:{}] >>> PARTITION 2: Parallel Stream Chunking into JSONL...", runId);
             chunkSummary = chunkingService.chunkAllStagedDocuments();
-            afterChunkingHeapMb = clearPartitionRam("Partition 2 (Chunking to JSONL)");
+
+            // ISOLATION GATE 2: Sever Partition 2 references, drain workers, and monitor GC convergence
+            afterChunkingHeapMb = executeIsolationGate(
+                    "Partition 2 (Chunking to JSONL)",
+                    "Partition 3 (Vector Embedding -> ChromaDB)"
+            );
 
             updateStatus(runId, true, "EMBED",
                     parseSummary.discovered(), parseSummary.processed(), parseSummary.failed(),
                     parseSummary.totalPages(), chunkSummary.totalChunks(), 0, pipelineStart.toEpochMilli());
 
-            // Stage 3: Vector Store Ingestion (Partition 3)
+            // ==================================================================
+            // STAGE 3: Vector Store Ingestion (Partition 3: JSONL -> ChromaDB)
+            // ==================================================================
             log.info("[PIPELINE:{}] >>> PARTITION 3: Vector Store Ingestion & ChromaDB Upsert...", runId);
             vectorSummary = vectorStoreService.ingestAllChunks();
-            afterVectorHeapMb = clearPartitionRam("Partition 3 (Vector Embedding -> ChromaDB)");
+
+            // ISOLATION GATE 3: Final partition boundary sweep
+            afterVectorHeapMb = executeIsolationGate(
+                    "Partition 3 (Vector Embedding -> ChromaDB)",
+                    "Post-Processing Completion"
+            );
 
             // Mark all validated jobs as COMPLETED
             for (DocumentJob job : checkpointService.getJobsByRunId(runId)) {
@@ -164,6 +190,56 @@ public class RagPipelineOrchestrator {
     }
 
     /**
+     * Strict Isolation Gate between pipeline partitions.
+     * Guarantees:
+     * 1. Active worker threads from the completed partition are drained and quiesced.
+     * 2. Heap buffers, file handles, and stream references are explicitly severed.
+     * 3. Monitored multi-cycle GC convergence loop verifies heap stabilization below
+     *    the 85% safety ceiling before the upcoming partition initializes its workers.
+     */
+    private long executeIsolationGate(String completedPartition, String upcomingPartition) {
+        log.info("[ISOLATION-GATE] >>> Entering isolation gate: [{}] -> [{}]", completedPartition, upcomingPartition);
+        long heapBefore = getUsedHeapMb();
+
+        // 1. Quiesce resource manager and await worker task completions
+        resourceManager.drainAndQuiesce();
+
+        // 2. Monitored GC convergence loop: multiple settling cycles until heap stabilizes
+        int maxCycles = 4;
+        long lastHeap = heapBefore;
+        long stabilizedHeap = heapBefore;
+
+        for (int cycle = 1; cycle <= maxCycles; cycle++) {
+            System.gc();
+            try {
+                Thread.sleep(60L * cycle); // Exponential settling pause
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            stabilizedHeap = getUsedHeapMb();
+            long delta = lastHeap - stabilizedHeap;
+            log.debug("[ISOLATION-GATE] Convergence cycle #{}: Heap before={}MB, after={}MB, delta={}MB",
+                    cycle, lastHeap, stabilizedHeap, delta);
+
+            // Stabilized if delta is negligible across cycles
+            if (Math.abs(delta) < 5 && cycle >= 2) {
+                break;
+            }
+            lastHeap = stabilizedHeap;
+        }
+
+        // 3. Assert memory is safe before allowing next phase to spawn worker threads
+        resourceManager.assertSafePartitionHandoff();
+
+        long reclaimedMb = Math.max(0, heapBefore - stabilizedHeap);
+        log.info("[ISOLATION-GATE] <<< Passed isolation gate to [{}]. Stabilized Heap: {}MB (Reclaimed ~{}MB)",
+                upcomingPartition, stabilizedHeap, reclaimedMb);
+
+        return stabilizedHeap;
+    }
+
+    /**
      * Resumes any incomplete or failed pipeline jobs from durable checkpoints.
      */
     public PipelineExecutionReport resumePipeline(String inputFolderPath) {
@@ -175,7 +251,6 @@ public class RagPipelineOrchestrator {
 
     public PipelineStatusSnapshot getLiveStatus() {
         PipelineStatusSnapshot current = liveStatus.get();
-        // Refresh live memory and resource state
         return new PipelineStatusSnapshot(
                 current.runId(),
                 current.isRunning(),
@@ -222,13 +297,6 @@ public class RagPipelineOrchestrator {
                 startTimeMs,
                 startTimeMs > 0 ? System.currentTimeMillis() - startTimeMs : 0
         ));
-    }
-
-    private long clearPartitionRam(String partitionName) {
-        resourceManager.forceReclaim();
-        long usedMb = getUsedHeapMb();
-        log.info("--- {} COMPLETED: RAM cleared. Active Heap: {}MB ---", partitionName, usedMb);
-        return usedMb;
     }
 
     private long getUsedHeapMb() {

@@ -154,6 +154,15 @@ public class PdfParallelParserService {
         String baseName = getBaseName(filename);
         Path targetMdPath = stagingDir.resolve(baseName + ".md");
 
+        // Proactive backpressure gate: halt task if memory is in CRITICAL state
+        try {
+            resourceManager.acquireIngestionGate();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("[DOC:{}] Ingestion interrupted at gate for {}", filename, pdfPath);
+            return;
+        }
+
         // 1. Streaming SHA-256 (Bounded 8KB RAM, never loads entire file into memory)
         String checksum = computeStreamingChecksum(pdfPath);
         if (checksum == null) {

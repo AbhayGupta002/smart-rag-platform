@@ -8,7 +8,9 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -26,6 +28,7 @@ import java.util.concurrent.*;
  * - Multi-tier L1/L2 Redis caching
  * - SingleFlight in-flight query deduplication
  * - Fair FIFO Semaphore backpressure & queue timeout
+ * - Multi-Tier Failover Synthesis (Cloud RestClient -> Local Ollama RestClient -> Deterministic Extractive)
  * - Circuit breaker with graceful fast-fallback
  * - Query relevance filtering (eliminates boilerplate preambles & code noise)
  * - Server-Sent Events (SSE) token streaming to frontend
@@ -43,6 +46,7 @@ public class RagGenerationService {
     private final QueryMetricsTracker metricsTracker;
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
+    private final RestClient restClient;
     private final ExecutorService streamingExecutor;
 
     @Value("${rag.llm.provider:AUTO}")
@@ -97,6 +101,13 @@ public class RagGenerationService {
                 .version(HttpClient.Version.HTTP_2)
                 .connectTimeout(Duration.ofSeconds(6))
                 .executor(streamingExecutor)
+                .build();
+
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(4000);
+        requestFactory.setReadTimeout(15000);
+        this.restClient = RestClient.builder()
+                .requestFactory(requestFactory)
                 .build();
     }
 
@@ -375,17 +386,9 @@ public class RagGenerationService {
             }
         }
 
-        // Generate comprehensive answer via Free LLM Chain with graceful Extractive Fallback
-        String answer = null;
-        if (circuitBreaker.allowExecution()) {
-            answer = callFreeLlmChain(query, contextBuilder.toString(), cleanResults);
-        }
-
-        if (answer == null || answer.isBlank()) {
-            answer = relevanceFilter.synthesizeExtractiveAnswer(query, cleanResults);
-        }
-
-        answer = cleanAnswerFormatting(answer);
+        // Execute Multi-Tier Failover Synthesis Loop:
+        // Tier 1 (External Cloud LLM via Spring RestClient) -> Tier 2 (Local Ollama via Spring RestClient) -> Tier 3 (Deterministic Extractive)
+        String answer = executeMultiTierSynthesis(query, contextBuilder.toString(), cleanResults);
 
         return new RagAnswer(query, answer, citations, cleanResults.size());
     }
@@ -432,57 +435,95 @@ public class RagGenerationService {
     }
 
     /**
-     * Dispatches query to the active Free LLM provider or cascading AUTO fallback chain.
+     * Executes the Multi-Tier Failover Synthesis Loop:
+     * - Tier 1: Primary Cloud LLM via Spring RestClient (Groq, Gemini, OpenRouter) guarded by Circuit Breaker
+     * - Tier 2: Local Ollama instance (http://localhost:11434 / host.docker.internal:11434) via Spring RestClient
+     * - Tier 3: Local Deterministic Extractive Synthesis component
      */
-    private String callFreeLlmChain(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {
-        String prov = currentProvider.get();
+    public String executeMultiTierSynthesis(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {
+        String prompt = buildSystemPrompt(query, context);
 
-        if ("GROQ".equals(prov)) {
-            String res = callGroqLlm(query, context);
-            if (res != null && !res.isBlank()) return res;
-        } else if ("GEMINI".equals(prov)) {
-            String res = callGeminiLlm(query, context);
-            if (res != null && !res.isBlank()) return res;
-        } else if ("OPENROUTER".equals(prov)) {
-            String res = callOpenRouterLlm(query, context);
-            if (res != null && !res.isBlank()) return res;
-        } else if ("OLLAMA".equals(prov)) {
-            String res = callOllamaLlm(query, context);
-            if (res != null && !res.isBlank()) return res;
+        // ==============================================================
+        // TIER 1: External Cloud LLM Provider (Guarded by Circuit Breaker)
+        // ==============================================================
+        if (circuitBreaker.allowExecution()) {
+            try {
+                String cloudResponse = callTier1CloudLlm(prompt);
+                if (cloudResponse != null && !cloudResponse.isBlank()) {
+                    circuitBreaker.recordSuccess();
+                    log.info("[SYNTHESIS-TIER1] Primary Cloud LLM generation succeeded.");
+                    return cleanAnswerFormatting(cloudResponse);
+                }
+            } catch (Exception ex) {
+                circuitBreaker.recordFailure();
+                log.warn("[SYNTHESIS-TIER1] Cloud LLM provider failed or throttled: {}. Triggering failover...", ex.getMessage());
+            }
         } else {
-            // AUTO: Groq (ultra fast free) -> Gemini (high quality free) -> OpenRouter -> Ollama
-            String groqKey = currentGroqKey.get();
-            if (groqKey != null && !groqKey.isBlank()) {
-                String res = callGroqLlm(query, context);
-                if (res != null && !res.isBlank()) return res;
-            }
-
-            String geminiKey = currentGeminiKey.get();
-            if (geminiKey != null && !geminiKey.isBlank()) {
-                String res = callGeminiLlm(query, context);
-                if (res != null && !res.isBlank()) return res;
-            }
-
-            String openrouterKey = currentOpenrouterKey.get();
-            if (openrouterKey != null && !openrouterKey.isBlank()) {
-                String res = callOpenRouterLlm(query, context);
-                if (res != null && !res.isBlank()) return res;
-            }
-
-            String ollamaRes = callOllamaLlm(query, context);
-            if (ollamaRes != null && !ollamaRes.isBlank()) return ollamaRes;
+            log.warn("[SYNTHESIS-TIER1] Circuit Breaker is OPEN. Bypassing cloud provider to prevent pool exhaustion.");
         }
 
+        // ==============================================================
+        // TIER 2: Local Ollama Instance (http://localhost:11434)
+        // ==============================================================
+        try {
+            log.info("[SYNTHESIS-TIER2] Routing request to Tier 2: Local Ollama instance via Spring RestClient...");
+            String ollamaResponse = callTier2Ollama(prompt);
+            if (ollamaResponse != null && !ollamaResponse.isBlank()) {
+                log.info("[SYNTHESIS-TIER2] Local Ollama fallback succeeded.");
+                return cleanAnswerFormatting(ollamaResponse);
+            }
+        } catch (Exception ex) {
+            log.warn("[SYNTHESIS-TIER2] Local Ollama fallback unavailable: {}. Degrading to Tier 3...", ex.getMessage());
+        }
+
+        // ==============================================================
+        // TIER 3: Local Deterministic Extractive Synthesis Component
+        // ==============================================================
+        log.info("[SYNTHESIS-TIER3] Routing transaction to Tier 3: Local Deterministic Extractive Synthesis.");
+        String extractiveAnswer = relevanceFilter.synthesizeExtractiveAnswer(query, results);
+        return cleanAnswerFormatting(extractiveAnswer);
+    }
+
+    private String callTier1CloudLlm(String prompt) throws Exception {
+        String provider = currentProvider.get();
+        if ("OLLAMA".equalsIgnoreCase(provider)) {
+            // Ollama configured as primary; handled by Tier 2 logic
+            return null;
+        }
+
+        if ("GROQ".equalsIgnoreCase(provider)) {
+            return callGroqWithRestClient(prompt);
+        } else if ("GEMINI".equalsIgnoreCase(provider)) {
+            return callGeminiWithRestClient(prompt);
+        } else if ("OPENROUTER".equalsIgnoreCase(provider)) {
+            return callOpenRouterWithRestClient(prompt);
+        } else {
+            // AUTO Mode: Groq -> Gemini -> OpenRouter
+            String groqKey = currentGroqKey.get();
+            if (groqKey != null && !groqKey.isBlank()) {
+                String ans = callGroqWithRestClient(prompt);
+                if (ans != null && !ans.isBlank()) return ans;
+            }
+            String geminiKey = currentGeminiKey.get();
+            if (geminiKey != null && !geminiKey.isBlank()) {
+                String ans = callGeminiWithRestClient(prompt);
+                if (ans != null && !ans.isBlank()) return ans;
+            }
+            String openRouterKey = currentOpenrouterKey.get();
+            if (openRouterKey != null && !openRouterKey.isBlank()) {
+                String ans = callOpenRouterWithRestClient(prompt);
+                if (ans != null && !ans.isBlank()) return ans;
+            }
+        }
         return null;
     }
 
-    private String callGroqLlm(String query, String context) {
+    private String callGroqWithRestClient(String prompt) {
         String key = currentGroqKey.get();
         if (key == null || key.isBlank()) return null;
         try {
             String model = (currentModel.get() != null && !currentModel.get().isBlank())
                     ? currentModel.get() : "llama-3.3-70b-versatile";
-            String prompt = buildSystemPrompt(query, context);
 
             Map<String, Object> body = Map.of(
                     "model", model,
@@ -494,80 +535,68 @@ public class RagGenerationService {
                     "max_tokens", 1500
             );
 
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
-                    .header("Content-Type", "application/json")
+            String responseJson = restClient.post()
+                    .uri("https://api.groq.com/openai/v1/chat/completions")
                     .header("Authorization", "Bearer " + key)
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                    .timeout(Duration.ofSeconds(15))
-                    .build();
+                    .header("Content-Type", "application/json")
+                    .body(objectMapper.writeValueAsString(body))
+                    .retrieve()
+                    .body(String.class);
 
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) {
-                circuitBreaker.recordSuccess();
-                JsonNode root = objectMapper.readTree(resp.body());
+            if (responseJson != null && !responseJson.isBlank()) {
+                JsonNode root = objectMapper.readTree(responseJson);
                 String text = root.path("choices").path(0).path("message").path("content").asText();
                 if (text != null && !text.isBlank()) {
                     return text.trim();
                 }
-            } else {
-                circuitBreaker.recordFailure();
-                log.warn("[GROQ] API call returned status: {} body: {}", resp.statusCode(), resp.body());
             }
         } catch (Exception e) {
-            circuitBreaker.recordFailure();
-            log.warn("[GROQ] API call failed: {}", e.getMessage());
+            log.warn("[GROQ-REST-CLIENT] Call failed: {}", e.getMessage());
+            throw new RuntimeException("Groq API error: " + e.getMessage(), e);
         }
         return null;
     }
 
-    private String callGeminiLlm(String query, String context) {
+    private String callGeminiWithRestClient(String prompt) {
         String key = currentGeminiKey.get();
         if (key == null || key.isBlank()) return null;
         try {
             String model = (currentModel.get() != null && !currentModel.get().isBlank())
                     ? currentModel.get() : "gemini-1.5-flash";
             String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key;
-            String prompt = buildSystemPrompt(query, context);
 
             Map<String, Object> body = Map.of(
                     "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
                     "generationConfig", Map.of("temperature", 0.3, "maxOutputTokens", 1500)
             );
 
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
+            String responseJson = restClient.post()
+                    .uri(url)
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                    .timeout(Duration.ofSeconds(18))
-                    .build();
+                    .body(objectMapper.writeValueAsString(body))
+                    .retrieve()
+                    .body(String.class);
 
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) {
-                circuitBreaker.recordSuccess();
-                JsonNode root = objectMapper.readTree(resp.body());
+            if (responseJson != null && !responseJson.isBlank()) {
+                JsonNode root = objectMapper.readTree(responseJson);
                 String text = root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText();
                 if (text != null && !text.isBlank()) {
                     return text.trim();
                 }
-            } else {
-                circuitBreaker.recordFailure();
-                log.warn("[GEMINI] API call returned status: {} body: {}", resp.statusCode(), resp.body());
             }
         } catch (Exception e) {
-            circuitBreaker.recordFailure();
-            log.warn("[GEMINI] API call failed: {}", e.getMessage());
+            log.warn("[GEMINI-REST-CLIENT] Call failed: {}", e.getMessage());
+            throw new RuntimeException("Gemini API error: " + e.getMessage(), e);
         }
         return null;
     }
 
-    private String callOpenRouterLlm(String query, String context) {
+    private String callOpenRouterWithRestClient(String prompt) {
         String key = currentOpenrouterKey.get();
         if (key == null || key.isBlank()) return null;
         try {
             String model = (currentModel.get() != null && !currentModel.get().isBlank())
                     ? currentModel.get() : "meta-llama/llama-3.2-3b-instruct:free";
-            String prompt = buildSystemPrompt(query, context);
 
             Map<String, Object> body = Map.of(
                     "model", model,
@@ -579,70 +608,67 @@ public class RagGenerationService {
                     "max_tokens", 1500
             );
 
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
-                    .header("Content-Type", "application/json")
+            String responseJson = restClient.post()
+                    .uri("https://openrouter.ai/api/v1/chat/completions")
                     .header("Authorization", "Bearer " + key)
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                    .timeout(Duration.ofSeconds(18))
-                    .build();
+                    .header("Content-Type", "application/json")
+                    .body(objectMapper.writeValueAsString(body))
+                    .retrieve()
+                    .body(String.class);
 
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) {
-                circuitBreaker.recordSuccess();
-                JsonNode root = objectMapper.readTree(resp.body());
+            if (responseJson != null && !responseJson.isBlank()) {
+                JsonNode root = objectMapper.readTree(responseJson);
                 String text = root.path("choices").path(0).path("message").path("content").asText();
                 if (text != null && !text.isBlank()) {
                     return text.trim();
                 }
-            } else {
-                circuitBreaker.recordFailure();
-                log.warn("[OPENROUTER] API call returned status: {}", resp.statusCode());
             }
         } catch (Exception e) {
-            circuitBreaker.recordFailure();
-            log.warn("[OPENROUTER] API call failed: {}", e.getMessage());
+            log.warn("[OPENROUTER-REST-CLIENT] Call failed: {}", e.getMessage());
+            throw new RuntimeException("OpenRouter API error: " + e.getMessage(), e);
         }
         return null;
     }
 
-    private String callOllamaLlm(String query, String context) {
+    private String callTier2Ollama(String prompt) {
         String endpoint = currentEndpoint.get();
         String model = (currentModel.get() != null && !currentModel.get().isBlank()) ? currentModel.get() : "llama3.2";
-        String prompt = buildSystemPrompt(query, context);
 
-        // Try primary endpoint, then try host.docker.internal if running in container
-        List<String> endpoints = new ArrayList<>();
-        endpoints.add(endpoint);
-        if (endpoint.contains("localhost")) {
-            endpoints.add(endpoint.replace("localhost", "host.docker.internal"));
+        List<String> targetEndpoints = new ArrayList<>();
+        if (endpoint != null && !endpoint.isBlank()) {
+            targetEndpoints.add(endpoint);
         }
+        if (!targetEndpoints.contains("http://localhost:11434/api/generate")) {
+            targetEndpoints.add("http://localhost:11434/api/generate");
+        }
+        targetEndpoints.add("http://host.docker.internal:11434/api/generate");
 
-        for (String ep : endpoints) {
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "prompt", prompt,
+                "stream", false
+        );
+
+        for (String targetUrl : targetEndpoints) {
             try {
-                Map<String, Object> body = Map.of(
-                        "model", model,
-                        "prompt", prompt,
-                        "stream", false
-                );
-
-                HttpRequest req = HttpRequest.newBuilder()
-                        .uri(URI.create(ep))
+                String requestJson = objectMapper.writeValueAsString(body);
+                String responseJson = restClient.post()
+                        .uri(targetUrl)
                         .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                        .timeout(Duration.ofSeconds(8))
-                        .build();
+                        .body(requestJson)
+                        .retrieve()
+                        .body(String.class);
 
-                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-                if (resp.statusCode() == 200) {
-                    circuitBreaker.recordSuccess();
-                    JsonNode root = objectMapper.readTree(resp.body());
+                if (responseJson != null && !responseJson.isBlank()) {
+                    JsonNode root = objectMapper.readTree(responseJson);
                     String text = root.path("response").asText();
                     if (text != null && !text.isBlank()) {
                         return text.trim();
                     }
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                log.debug("[OLLAMA-REST-CLIENT] Endpoint {} failed: {}", targetUrl, e.getMessage());
+            }
         }
         return null;
     }
