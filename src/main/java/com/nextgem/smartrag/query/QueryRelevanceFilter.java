@@ -181,18 +181,46 @@ public class QueryRelevanceFilter {
             validCandidates = validCandidates.stream().filter(r -> r.score() >= cutoff).collect(Collectors.toList());
         }
 
-        // Group by primary topic: Find the best matching document/topic and prioritize its chunks
+        // Group by primary topic: Find the best matching document/topic and strictly isolate unrelated documents
         if (!validCandidates.isEmpty()) {
             String bestDoc = validCandidates.get(0).document();
             List<ChromaVectorStoreService.SearchResult> sameDoc = validCandidates.stream()
                     .filter(r -> r.document().equals(bestDoc))
                     .collect(Collectors.toList());
-            if (sameDoc.size() >= 2) {
-                return sameDoc.stream().limit(5).collect(Collectors.toList());
+            if (!sameDoc.isEmpty()) {
+                // When best document has reasonable confidence or multiple chunks, strictly keep only chunks from the same document
+                if (validCandidates.get(0).score() >= 0.30 || sameDoc.size() >= 2) {
+                    return sameDoc.stream().limit(5).collect(Collectors.toList());
+                }
             }
         }
 
-        return validCandidates.stream().limit(5).collect(Collectors.toList());
+        // Only retain candidates that have at least 0.30 score or a direct keyword match
+        return validCandidates.stream()
+                .filter(r -> r.score() >= 0.30 || queryKeywords.stream().anyMatch(k -> (r.document() + " " + r.text()).toLowerCase().contains(k)))
+                .limit(5)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Normalizes and expands queries by splitting common concatenated terms
+     * (e.g. "madhyapradesh" -> "madhya pradesh") for improved vector alignment.
+     */
+    public String normalizeAndExpandQuery(String query) {
+        if (query == null || query.isBlank()) return "";
+        String normalized = query.trim();
+
+        // Common concatenated location, syllabus, and technical terms
+        normalized = normalized.replaceAll("(?i)\\bmadhyapradesh\\b", "madhya pradesh");
+        normalized = normalized.replaceAll("(?i)\\bandhrapradesh\\b", "andhra pradesh");
+        normalized = normalized.replaceAll("(?i)\\buttarpradesh\\b", "uttar pradesh");
+        normalized = normalized.replaceAll("(?i)\\bhimachalpradesh\\b", "himachal pradesh");
+        normalized = normalized.replaceAll("(?i)\\bupscsyllabus\\b", "upsc syllabus");
+        normalized = normalized.replaceAll("(?i)\\bfrontendoptimization\\b", "frontend optimization");
+        normalized = normalized.replaceAll("(?i)\\bpunjabiliterature\\b", "punjabi literature");
+        normalized = normalized.replaceAll("(?i)\\bmanipuriliterature\\b", "manipuri literature");
+
+        return normalized;
     }
 
     public boolean isResumeChunk(String text, String query) {
@@ -605,13 +633,21 @@ public class QueryRelevanceFilter {
         return salient;
     }
 
-    private Set<String> extractKeywords(String query) {
+    public Set<String> extractKeywords(String query) {
+        String expanded = normalizeAndExpandQuery(query);
         Set<String> stopWords = Set.of(
                 "what", "is", "the", "a", "an", "and", "or", "how", "to", "in", "on", "for",
                 "with", "about", "tell", "me", "give", "can", "you", "does", "do", "explain"
         );
-        return Arrays.stream(query.toLowerCase().split("[^a-z0-9]+"))
+        Set<String> keywords = Arrays.stream(expanded.toLowerCase().split("[^a-z0-9]+"))
                 .filter(w -> w.length() > 2 && !stopWords.contains(w))
                 .collect(Collectors.toSet());
+        // Also add the raw query keywords if not in stopwords
+        if (query != null) {
+            Arrays.stream(query.toLowerCase().split("[^a-z0-9]+"))
+                    .filter(w -> w.length() > 2 && !stopWords.contains(w))
+                    .forEach(keywords::add);
+        }
+        return keywords;
     }
 }

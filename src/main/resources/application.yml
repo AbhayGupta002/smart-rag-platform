@@ -82,12 +82,15 @@ rag:
 # Supports: Google Gemini API, Local Ollama, or Extractive Fallback
 # ==============================================================================
   llm:
-    # Ollama local inference endpoint (used when gemini-api-key is empty)
-    endpoint: "http://localhost:11434/api/generate"
-    model: "llama3.2"
-    # Google Gemini API key (set via env: RAG_LLM_GEMINI_API_KEY)
-    # If set, Gemini is used as primary; if blank, Ollama is tried then extractive fallback
-    gemini-api-key: "${RAG_LLM_GEMINI_API_KEY:}"
+    provider: "${RAG_LLM_PROVIDER:AUTO}"
+    endpoint: "${RAG_LLM_ENDPOINT:http://localhost:11434/api/generate}"
+    model: "${RAG_LLM_MODEL:}"
+    # Groq API Key (100% Free tier at console.groq.com - recommended)
+    groq-api-key: "${GROQ_API_KEY:}"
+    # Google Gemini API key (Free tier at aistudio.google.com)
+    gemini-api-key: "${RAG_LLM_GEMINI_API_KEY:${GEMINI_API_KEY:}}"
+    # OpenRouter API key (Free models at openrouter.ai)
+    openrouter-api-key: "${OPENROUTER_API_KEY:}"
 
 logging:
   level:

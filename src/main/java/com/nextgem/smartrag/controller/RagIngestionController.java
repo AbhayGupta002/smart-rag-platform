@@ -247,6 +247,55 @@ public class RagIngestionController {
     }
 
     /**
+     * Get Current Active Free LLM Model Configuration & Status.
+     */
+    @GetMapping("/llm-config")
+    public ResponseEntity<RagGenerationService.LlmStatus> getLlmConfig() {
+        return ResponseEntity.ok(generationService.getLlmConfig());
+    }
+
+    /**
+     * Update Free LLM Model Configuration at Runtime.
+     */
+    @PostMapping("/llm-config")
+    public ResponseEntity<RagGenerationService.LlmStatus> updateLlmConfig(
+            @RequestBody(required = false) Map<String, String> body,
+            @RequestParam(required = false) String provider,
+            @RequestParam(required = false) String apiKey,
+            @RequestParam(required = false) String model,
+            @RequestParam(required = false) String endpoint
+    ) {
+        Map<String, String> config = (body != null) ? new HashMap<>(body) : new HashMap<>();
+        if (provider != null) config.put("provider", provider);
+        if (apiKey != null) config.put("apiKey", apiKey);
+        if (model != null) config.put("model", model);
+        if (endpoint != null) config.put("endpoint", endpoint);
+
+        generationService.updateLlmConfig(config);
+        return ResponseEntity.ok(generationService.getLlmConfig());
+    }
+
+    /**
+     * Live Connectivity Test for Free LLM Provider.
+     */
+    @PostMapping("/llm-test")
+    public ResponseEntity<Map<String, Object>> testLlmConnection(
+            @RequestBody(required = false) Map<String, String> body,
+            @RequestParam(required = false) String provider,
+            @RequestParam(required = false) String apiKey,
+            @RequestParam(required = false) String model,
+            @RequestParam(required = false) String endpoint
+    ) {
+        Map<String, String> config = (body != null) ? new HashMap<>(body) : new HashMap<>();
+        if (provider != null) config.put("provider", provider);
+        if (apiKey != null) config.put("apiKey", apiKey);
+        if (model != null) config.put("model", model);
+        if (endpoint != null) config.put("endpoint", endpoint);
+
+        return ResponseEntity.ok(generationService.testLlmConnection(config));
+    }
+
+    /**
      * Real-time Query System Concurrency & Cache Metrics.
      */
     @GetMapping("/query-metrics")

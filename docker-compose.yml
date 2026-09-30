@@ -44,7 +44,12 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - CHROMA_URL=http://chromadb:8000
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - RAG_LLM_GEMINI_API_KEY=${RAG_LLM_GEMINI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - RAG_LLM_PROVIDER=${RAG_LLM_PROVIDER:-AUTO}
+      - RAG_LLM_MODEL=${RAG_LLM_MODEL:-}
       - JAVA_OPTS=-server -Xms256m -Xmx1024m -XX:MaxDirectMemorySize=512m -XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:G1ReservePercent=15 -XX:InitiatingHeapOccupancyPercent=45 -Dorg.apache.pdfbox.rendering.UsePureJava=true -Dfile.encoding=UTF-8
     depends_on:
       - chromadb

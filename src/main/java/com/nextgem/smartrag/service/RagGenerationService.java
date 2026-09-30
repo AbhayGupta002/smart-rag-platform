@@ -45,14 +45,30 @@ public class RagGenerationService {
     private final HttpClient httpClient;
     private final ExecutorService streamingExecutor;
 
+    @Value("${rag.llm.provider:AUTO}")
+    private String configuredProvider;
+
     @Value("${rag.llm.endpoint:http://localhost:11434/api/generate}")
-    private String llmEndpoint;
+    private String configuredEndpoint;
 
-    @Value("${rag.llm.model:llama3.2}")
-    private String llmModel;
+    @Value("${rag.llm.model:}")
+    private String configuredModel;
 
-    @Value("${rag.llm.gemini-api-key:}")
-    private String geminiApiKey;
+    @Value("${rag.llm.groq-api-key:${GROQ_API_KEY:}}")
+    private String configuredGroqApiKey;
+
+    @Value("${rag.llm.gemini-api-key:${RAG_LLM_GEMINI_API_KEY:${GEMINI_API_KEY:}}}")
+    private String configuredGeminiApiKey;
+
+    @Value("${rag.llm.openrouter-api-key:${OPENROUTER_API_KEY:}}")
+    private String configuredOpenrouterApiKey;
+
+    private final java.util.concurrent.atomic.AtomicReference<String> currentProvider = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<String> currentGroqKey = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<String> currentGeminiKey = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<String> currentOpenrouterKey = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<String> currentModel = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<String> currentEndpoint = new java.util.concurrent.atomic.AtomicReference<>();
 
     public RagGenerationService(
             ChromaVectorStoreService vectorStoreService,
@@ -79,14 +95,21 @@ public class RagGenerationService {
 
         this.httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_2)
-                .connectTimeout(Duration.ofSeconds(4))
+                .connectTimeout(Duration.ofSeconds(6))
                 .executor(streamingExecutor)
                 .build();
     }
 
     @PostConstruct
     public void warmup() {
-        log.info("[RAG-QA] Pre-warming query pipeline, caches, and dependency connections...");
+        currentProvider.set((configuredProvider != null && !configuredProvider.isBlank()) ? configuredProvider.trim().toUpperCase() : "AUTO");
+        currentGroqKey.set(configuredGroqApiKey != null ? configuredGroqApiKey.trim() : "");
+        currentGeminiKey.set(configuredGeminiApiKey != null ? configuredGeminiApiKey.trim() : "");
+        currentOpenrouterKey.set(configuredOpenrouterApiKey != null ? configuredOpenrouterApiKey.trim() : "");
+        currentModel.set(configuredModel != null ? configuredModel.trim() : "");
+        currentEndpoint.set(configuredEndpoint != null ? configuredEndpoint.trim() : "http://localhost:11434/api/generate");
+
+        log.info("[RAG-QA] Pre-warming query pipeline, caches, and dependency connections... Active Free LLM Provider: {}", currentProvider.get());
         try {
             String probe = "warmup probe";
             cacheService.putEmbedding(probe, vectorStoreService.computeLightweightEmbedding(probe));
@@ -96,9 +119,150 @@ public class RagGenerationService {
         }
     }
 
+    public record LlmStatus(
+            String activeProvider,
+            String activeModel,
+            String endpoint,
+            boolean hasGroqKey,
+            boolean hasGeminiKey,
+            boolean hasOpenrouterKey,
+            String statusDescription
+    ) {}
+
+    public LlmStatus getLlmConfig() {
+        String prov = currentProvider.get();
+        String groq = currentGroqKey.get();
+        String gem = currentGeminiKey.get();
+        String openr = currentOpenrouterKey.get();
+
+        String statusDesc;
+        if ("GROQ".equals(prov) || ("AUTO".equals(prov) && groq != null && !groq.isBlank())) {
+            statusDesc = "Groq Cloud (Free Llama 3.3 / 3.1 Active)";
+        } else if ("GEMINI".equals(prov) || ("AUTO".equals(prov) && gem != null && !gem.isBlank())) {
+            statusDesc = "Google Gemini (Free Flash Active)";
+        } else if ("OPENROUTER".equals(prov) || ("AUTO".equals(prov) && openr != null && !openr.isBlank())) {
+            statusDesc = "OpenRouter (Free Models Active)";
+        } else if ("OLLAMA".equals(prov)) {
+            statusDesc = "Local Ollama Active";
+        } else {
+            statusDesc = "Intelligent Extractive Synthesis (Add free Groq/Gemini key for AI explanations)";
+        }
+
+        return new LlmStatus(
+                prov,
+                getEffectiveModel(),
+                currentEndpoint.get(),
+                groq != null && !groq.isBlank(),
+                gem != null && !gem.isBlank(),
+                openr != null && !openr.isBlank(),
+                statusDesc
+        );
+    }
+
+    public synchronized void updateLlmConfig(Map<String, String> config) {
+        if (config == null) return;
+        if (config.containsKey("provider") && config.get("provider") != null && !config.get("provider").isBlank()) {
+            currentProvider.set(config.get("provider").trim().toUpperCase());
+        }
+        if (config.containsKey("groqApiKey") && config.get("groqApiKey") != null) {
+            currentGroqKey.set(config.get("groqApiKey").trim());
+        }
+        if (config.containsKey("geminiApiKey") && config.get("geminiApiKey") != null) {
+            currentGeminiKey.set(config.get("geminiApiKey").trim());
+        }
+        if (config.containsKey("openrouterApiKey") && config.get("openrouterApiKey") != null) {
+            currentOpenrouterKey.set(config.get("openrouterApiKey").trim());
+        }
+        if (config.containsKey("apiKey") && config.get("apiKey") != null && !config.get("apiKey").isBlank()) {
+            String prov = currentProvider.get();
+            String key = config.get("apiKey").trim();
+            if ("GROQ".equals(prov) || key.startsWith("gsk_")) {
+                currentGroqKey.set(key);
+                if (!"GROQ".equals(prov) && "AUTO".equals(prov)) currentProvider.set("GROQ");
+            } else if ("OPENROUTER".equals(prov) || key.startsWith("sk-or-")) {
+                currentOpenrouterKey.set(key);
+                if (!"OPENROUTER".equals(prov) && "AUTO".equals(prov)) currentProvider.set("OPENROUTER");
+            } else {
+                currentGeminiKey.set(key);
+                if (!"GEMINI".equals(prov) && "AUTO".equals(prov)) currentProvider.set("GEMINI");
+            }
+        }
+        if (config.containsKey("model") && config.get("model") != null && !config.get("model").isBlank()) {
+            currentModel.set(config.get("model").trim());
+        }
+        if (config.containsKey("endpoint") && config.get("endpoint") != null && !config.get("endpoint").isBlank()) {
+            currentEndpoint.set(config.get("endpoint").trim());
+        }
+        log.info("[RAG-QA] Updated LLM configuration: provider={}, model={}", currentProvider.get(), getEffectiveModel());
+    }
+
+    public Map<String, Object> testLlmConnection(Map<String, String> testConfig) {
+        long start = System.currentTimeMillis();
+        String testProvider = (testConfig != null && testConfig.get("provider") != null && !testConfig.get("provider").isBlank())
+                ? testConfig.get("provider").trim().toUpperCase() : currentProvider.get();
+        String apiKey = (testConfig != null) ? testConfig.get("apiKey") : null;
+        String model = (testConfig != null) ? testConfig.get("model") : null;
+        String endpoint = (testConfig != null) ? testConfig.get("endpoint") : null;
+
+        String effectiveKey = (apiKey != null && !apiKey.isBlank()) ? apiKey.trim() :
+                ("GROQ".equals(testProvider) ? currentGroqKey.get() :
+                 "OPENROUTER".equals(testProvider) ? currentOpenrouterKey.get() : currentGeminiKey.get());
+
+        try {
+            String testPrompt = "Respond with exactly 1 sentence: 'Verified: Free AI model is connected successfully.'";
+            String reply = null;
+
+            if ("GROQ".equals(testProvider) || ("AUTO".equals(testProvider) && effectiveKey != null && effectiveKey.startsWith("gsk_"))) {
+                String mod = (model != null && !model.isBlank()) ? model : "llama-3.3-70b-versatile";
+                reply = directCallGroq(effectiveKey, mod, testPrompt);
+            } else if ("GEMINI".equals(testProvider) || ("AUTO".equals(testProvider) && effectiveKey != null && !effectiveKey.isBlank())) {
+                String mod = (model != null && !model.isBlank()) ? model : "gemini-1.5-flash";
+                reply = directCallGemini(effectiveKey, mod, testPrompt);
+            } else if ("OPENROUTER".equals(testProvider)) {
+                String mod = (model != null && !model.isBlank()) ? model : "meta-llama/llama-3.2-3b-instruct:free";
+                reply = directCallOpenRouter(effectiveKey, mod, testPrompt);
+            } else if ("OLLAMA".equals(testProvider)) {
+                String endp = (endpoint != null && !endpoint.isBlank()) ? endpoint : currentEndpoint.get();
+                String mod = (model != null && !model.isBlank()) ? model : "llama3.2";
+                reply = directCallOllama(endp, mod, testPrompt);
+            }
+
+            if (reply != null && !reply.isBlank()) {
+                return Map.of(
+                        "success", true,
+                        "provider", testProvider,
+                        "model", (model != null && !model.isBlank()) ? model : getEffectiveModel(),
+                        "latencyMs", (System.currentTimeMillis() - start),
+                        "reply", reply.trim()
+                );
+            }
+            return Map.of(
+                    "success", false,
+                    "provider", testProvider,
+                    "error", "Provider did not return a valid response. Please check your free API key or network connectivity."
+            );
+        } catch (Exception e) {
+            return Map.of(
+                    "success", false,
+                    "provider", testProvider,
+                    "error", e.getMessage() != null ? e.getMessage() : e.toString()
+            );
+        }
+    }
+
+    private String getEffectiveModel() {
+        String configured = currentModel.get();
+        if (configured != null && !configured.isBlank()) return configured;
+        String prov = currentProvider.get();
+        if ("GROQ".equals(prov)) return "llama-3.3-70b-versatile";
+        if ("GEMINI".equals(prov)) return "gemini-1.5-flash";
+        if ("OPENROUTER".equals(prov)) return "meta-llama/llama-3.2-3b-instruct:free";
+        return "llama3.2";
+    }
+
     /**
      * Answers a query using context retrieved from the vector store with multi-tier caching,
-     * in-flight deduplication, bounded concurrency, and relevance filtering.
+     * in-flight deduplication, bounded concurrency, relevance filtering, and Free LLM explanation.
      */
     public RagAnswer ask(String query, int topK) {
         long startTime = System.currentTimeMillis();
@@ -136,7 +300,7 @@ public class RagGenerationService {
                 }
             });
 
-            RagAnswer answer = future.get(15, TimeUnit.SECONDS);
+            RagAnswer answer = future.get(20, TimeUnit.SECONDS);
             // Cache computed answer
             cacheService.putAnswer(normQuery, safeK, answer);
             metricsTracker.recordSuccess(System.currentTimeMillis() - startTime);
@@ -162,11 +326,12 @@ public class RagGenerationService {
     }
 
     private RagAnswer doAskInternal(String query, int topK) {
+        String searchExpQuery = relevanceFilter.normalizeAndExpandQuery(query);
         int candidatePoolSize = Math.max(topK, 5) * 3;
-        List<ChromaVectorStoreService.SearchResult> rawResults = vectorStoreService.search(query, candidatePoolSize);
+        List<ChromaVectorStoreService.SearchResult> rawResults = vectorStoreService.search(searchExpQuery, candidatePoolSize);
 
         // Apply Relevance & Boilerplate Filtering
-        List<ChromaVectorStoreService.SearchResult> cleanResults = relevanceFilter.filterRelevantResults(rawResults, query, 0.25);
+        List<ChromaVectorStoreService.SearchResult> cleanResults = relevanceFilter.filterRelevantResults(rawResults, searchExpQuery, 0.25);
         int targetK = Math.max(topK, 5);
         if (cleanResults.size() > targetK) {
             cleanResults = cleanResults.subList(0, targetK);
@@ -175,7 +340,7 @@ public class RagGenerationService {
         if (cleanResults.isEmpty()) {
             return new RagAnswer(
                     query,
-                    "No relevant document context found in the vector index for your query. Please ingest documents first.",
+                    "No verified document context found in the vector index matching your query. Please ensure relevant documents have been uploaded and ingested.",
                     List.of(),
                     0
             );
@@ -208,11 +373,10 @@ public class RagGenerationService {
                     i + 1, docLabel, res.page(), res.heading() != null ? res.heading() : "", rawText));
         }
 
+        // Generate comprehensive answer via Free LLM Chain with graceful Extractive Fallback
         String answer = null;
-        if (geminiApiKey != null && !geminiApiKey.isBlank() && circuitBreaker.allowExecution()) {
-            answer = callGeminiLlm(query, contextBuilder.toString(), cleanResults);
-        } else if (circuitBreaker.allowExecution()) {
-            answer = callOllamaOrFallback(query, contextBuilder.toString(), cleanResults);
+        if (circuitBreaker.allowExecution()) {
+            answer = callFreeLlmChain(query, contextBuilder.toString(), cleanResults);
         }
 
         if (answer == null || answer.isBlank()) {
@@ -263,20 +427,115 @@ public class RagGenerationService {
         });
     }
 
-    private String callGeminiLlm(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {
+    /**
+     * Dispatches query to the active Free LLM provider or cascading AUTO fallback chain.
+     */
+    private String callFreeLlmChain(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {
+        String prov = currentProvider.get();
+
+        if ("GROQ".equals(prov)) {
+            String res = callGroqLlm(query, context);
+            if (res != null && !res.isBlank()) return res;
+        } else if ("GEMINI".equals(prov)) {
+            String res = callGeminiLlm(query, context);
+            if (res != null && !res.isBlank()) return res;
+        } else if ("OPENROUTER".equals(prov)) {
+            String res = callOpenRouterLlm(query, context);
+            if (res != null && !res.isBlank()) return res;
+        } else if ("OLLAMA".equals(prov)) {
+            String res = callOllamaLlm(query, context);
+            if (res != null && !res.isBlank()) return res;
+        } else {
+            // AUTO: Groq (ultra fast free) -> Gemini (high quality free) -> OpenRouter -> Ollama
+            String groqKey = currentGroqKey.get();
+            if (groqKey != null && !groqKey.isBlank()) {
+                String res = callGroqLlm(query, context);
+                if (res != null && !res.isBlank()) return res;
+            }
+
+            String geminiKey = currentGeminiKey.get();
+            if (geminiKey != null && !geminiKey.isBlank()) {
+                String res = callGeminiLlm(query, context);
+                if (res != null && !res.isBlank()) return res;
+            }
+
+            String openrouterKey = currentOpenrouterKey.get();
+            if (openrouterKey != null && !openrouterKey.isBlank()) {
+                String res = callOpenRouterLlm(query, context);
+                if (res != null && !res.isBlank()) return res;
+            }
+
+            String ollamaRes = callOllamaLlm(query, context);
+            if (ollamaRes != null && !ollamaRes.isBlank()) return ollamaRes;
+        }
+
+        return null;
+    }
+
+    private String callGroqLlm(String query, String context) {
+        String key = currentGroqKey.get();
+        if (key == null || key.isBlank()) return null;
         try {
-            String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + geminiApiKey;
+            String model = (currentModel.get() != null && !currentModel.get().isBlank())
+                    ? currentModel.get() : "llama-3.3-70b-versatile";
             String prompt = buildSystemPrompt(query, context);
 
             Map<String, Object> body = Map.of(
-                    "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt))))
+                    "model", model,
+                    "messages", List.of(
+                            Map.of("role", "system", "content", "You are an intelligent, articulate enterprise document AI assistant. Provide thorough, well-structured, and clear explanations in natural language based on the provided document context."),
+                            Map.of("role", "user", "content", prompt)
+                    ),
+                    "temperature", 0.3,
+                    "max_tokens", 1500
+            );
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + key)
+                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
+                    .timeout(Duration.ofSeconds(15))
+                    .build();
+
+            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                circuitBreaker.recordSuccess();
+                JsonNode root = objectMapper.readTree(resp.body());
+                String text = root.path("choices").path(0).path("message").path("content").asText();
+                if (text != null && !text.isBlank()) {
+                    return text.trim();
+                }
+            } else {
+                circuitBreaker.recordFailure();
+                log.warn("[GROQ] API call returned status: {} body: {}", resp.statusCode(), resp.body());
+            }
+        } catch (Exception e) {
+            circuitBreaker.recordFailure();
+            log.warn("[GROQ] API call failed: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    private String callGeminiLlm(String query, String context) {
+        String key = currentGeminiKey.get();
+        if (key == null || key.isBlank()) return null;
+        try {
+            String model = (currentModel.get() != null && !currentModel.get().isBlank())
+                    ? currentModel.get() : "gemini-1.5-flash";
+            String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key;
+            String prompt = buildSystemPrompt(query, context);
+
+            Map<String, Object> body = Map.of(
+                    "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
+                    "generationConfig", Map.of("temperature", 0.3, "maxOutputTokens", 1500)
             );
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                    .timeout(Duration.ofSeconds(10))
+                    .timeout(Duration.ofSeconds(18))
                     .build();
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
@@ -285,59 +544,197 @@ public class RagGenerationService {
                 JsonNode root = objectMapper.readTree(resp.body());
                 String text = root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText();
                 if (text != null && !text.isBlank()) {
-                    return text;
+                    return text.trim();
                 }
             } else {
                 circuitBreaker.recordFailure();
-                log.warn("Gemini API call returned status: {}", resp.statusCode());
+                log.warn("[GEMINI] API call returned status: {} body: {}", resp.statusCode(), resp.body());
             }
         } catch (Exception e) {
             circuitBreaker.recordFailure();
-            log.warn("Gemini API call failed: {}", e.getMessage());
+            log.warn("[GEMINI] API call failed: {}", e.getMessage());
         }
-        return relevanceFilter.synthesizeExtractiveAnswer(query, results);
+        return null;
     }
 
-    private String callOllamaOrFallback(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {
+    private String callOpenRouterLlm(String query, String context) {
+        String key = currentOpenrouterKey.get();
+        if (key == null || key.isBlank()) return null;
         try {
+            String model = (currentModel.get() != null && !currentModel.get().isBlank())
+                    ? currentModel.get() : "meta-llama/llama-3.2-3b-instruct:free";
             String prompt = buildSystemPrompt(query, context);
+
             Map<String, Object> body = Map.of(
-                    "model", llmModel,
-                    "prompt", prompt,
-                    "stream", false
+                    "model", model,
+                    "messages", List.of(
+                            Map.of("role", "system", "content", "You are an intelligent enterprise document AI assistant."),
+                            Map.of("role", "user", "content", prompt)
+                    ),
+                    "temperature", 0.3,
+                    "max_tokens", 1500
             );
 
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(llmEndpoint))
+                    .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
                     .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + key)
                     .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                    .timeout(Duration.ofSeconds(3))
+                    .timeout(Duration.ofSeconds(18))
                     .build();
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() == 200) {
                 circuitBreaker.recordSuccess();
                 JsonNode root = objectMapper.readTree(resp.body());
-                return root.path("response").asText();
+                String text = root.path("choices").path(0).path("message").path("content").asText();
+                if (text != null && !text.isBlank()) {
+                    return text.trim();
+                }
             } else {
                 circuitBreaker.recordFailure();
+                log.warn("[OPENROUTER] API call returned status: {}", resp.statusCode());
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
             circuitBreaker.recordFailure();
+            log.warn("[OPENROUTER] API call failed: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    private String callOllamaLlm(String query, String context) {
+        String endpoint = currentEndpoint.get();
+        String model = (currentModel.get() != null && !currentModel.get().isBlank()) ? currentModel.get() : "llama3.2";
+        String prompt = buildSystemPrompt(query, context);
+
+        // Try primary endpoint, then try host.docker.internal if running in container
+        List<String> endpoints = new ArrayList<>();
+        endpoints.add(endpoint);
+        if (endpoint.contains("localhost")) {
+            endpoints.add(endpoint.replace("localhost", "host.docker.internal"));
         }
 
-        // Use intelligent extractive synthesis
-        return relevanceFilter.synthesizeExtractiveAnswer(query, results);
+        for (String ep : endpoints) {
+            try {
+                Map<String, Object> body = Map.of(
+                        "model", model,
+                        "prompt", prompt,
+                        "stream", false
+                );
+
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(ep))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
+                        .timeout(Duration.ofSeconds(8))
+                        .build();
+
+                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200) {
+                    circuitBreaker.recordSuccess();
+                    JsonNode root = objectMapper.readTree(resp.body());
+                    String text = root.path("response").asText();
+                    if (text != null && !text.isBlank()) {
+                        return text.trim();
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    private String directCallGroq(String apiKey, String model, String prompt) throws Exception {
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "messages", List.of(Map.of("role", "user", "content", prompt)),
+                "max_tokens", 80
+        );
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(8))
+                .build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() == 200) {
+            JsonNode root = objectMapper.readTree(resp.body());
+            return root.path("choices").path(0).path("message").path("content").asText();
+        }
+        throw new IOException("Groq returned status " + resp.statusCode() + ": " + resp.body());
+    }
+
+    private String directCallGemini(String apiKey, String model, String prompt) throws Exception {
+        String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
+        Map<String, Object> body = Map.of(
+                "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt))))
+        );
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(10))
+                .build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() == 200) {
+            JsonNode root = objectMapper.readTree(resp.body());
+            return root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText();
+        }
+        throw new IOException("Gemini returned status " + resp.statusCode() + ": " + resp.body());
+    }
+
+    private String directCallOpenRouter(String apiKey, String model, String prompt) throws Exception {
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "messages", List.of(Map.of("role", "user", "content", prompt)),
+                "max_tokens", 80
+        );
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(10))
+                .build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() == 200) {
+            JsonNode root = objectMapper.readTree(resp.body());
+            return root.path("choices").path(0).path("message").path("content").asText();
+        }
+        throw new IOException("OpenRouter returned status " + resp.statusCode() + ": " + resp.body());
+    }
+
+    private String directCallOllama(String endpoint, String model, String prompt) throws Exception {
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "prompt", prompt,
+                "stream", false
+        );
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(6))
+                .build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() == 200) {
+            JsonNode root = objectMapper.readTree(resp.body());
+            return root.path("response").asText();
+        }
+        throw new IOException("Ollama returned status " + resp.statusCode() + ": " + resp.body());
     }
 
     private String buildSystemPrompt(String query, String context) {
-        return "You are a specialized enterprise document QA assistant.\n" +
-                "Answer the following question STRICTLY and ONLY using the provided document context.\n" +
-                "Always cite the source document name, page number, and section heading.\n" +
-                "Do not make up facts or extrapolate beyond the provided text.\n\n" +
-                "CONTEXT:\n" + context + "\n\n" +
-                "QUESTION:\n" + query + "\n\n" +
-                "ANSWER:";
+        return "You are an intelligent, articulate enterprise AI document assistant.\n\n" +
+                "The user is asking: \"" + query + "\"\n\n" +
+                "INSTRUCTIONS:\n" +
+                "1. Provide a comprehensive, well-structured, and clear explanation answering the user's question in natural language based on the provided document context.\n" +
+                "2. Synthesize facts into a natural narrative with an introductory overview, well-explained paragraphs, and organized bullet points for key details.\n" +
+                "3. Ground all factual statements in the provided context. Cite relevant document names or pages where appropriate.\n" +
+                "4. Do NOT output raw OCR junk, outline codes, or fragmented notes.\n" +
+                "5. Present a polished, professional response that fully explains the topic to the user.\n\n" +
+                "DOCUMENT CONTEXT:\n" + context + "\n\n" +
+                "DETAILED EXPLANATION:";
     }
 
     public record Citation(String document, int page, String heading, double similarityScore, String preview) {}
