@@ -5,7 +5,7 @@ import com.nextgem.smartrag.config.RagPipelineProperties;
 import com.nextgem.smartrag.model.DocumentJob;
 import com.nextgem.smartrag.orchestrator.RagPipelineOrchestrator;
 import com.nextgem.smartrag.parser.PdfParallelParserService;
-import com.nextgem.smartrag.repository.DocumentJobRepository;
+import com.nextgem.smartrag.repository.DocumentRepository;
 import com.nextgem.smartrag.service.*;
 import com.nextgem.smartrag.vectorstore.ChromaVectorStoreService;
 import org.springframework.http.HttpStatus;
@@ -32,7 +32,7 @@ public class RagIngestionController {
     private final RagChunkingService chunkingService;
     private final ChromaVectorStoreService vectorStoreService;
     private final RagGenerationService generationService;
-    private final DocumentJobRepository documentJobRepository;
+    private final DocumentRepository documentRepository;
     private final DynamicHardwareTuningService tuningService;
     private final OperatingSystemDetector osDetector;
     private final ResourceManager resourceManager;
@@ -58,7 +58,7 @@ public class RagIngestionController {
             RagChunkingService chunkingService,
             ChromaVectorStoreService vectorStoreService,
             RagGenerationService generationService,
-            DocumentJobRepository documentJobRepository,
+            DocumentRepository documentRepository,
             DynamicHardwareTuningService tuningService,
             OperatingSystemDetector osDetector,
             ResourceManager resourceManager,
@@ -71,7 +71,7 @@ public class RagIngestionController {
         this.chunkingService = chunkingService;
         this.vectorStoreService = vectorStoreService;
         this.generationService = generationService;
-        this.documentJobRepository = documentJobRepository;
+        this.documentRepository = documentRepository;
         this.tuningService = tuningService;
         this.osDetector = osDetector;
         this.resourceManager = resourceManager;
@@ -317,7 +317,7 @@ public class RagIngestionController {
      */
     @GetMapping("/jobs")
     public ResponseEntity<List<DocumentJob>> getJobs() {
-        return ResponseEntity.ok(documentJobRepository.findAll());
+        return ResponseEntity.ok(documentRepository.findAll());
     }
 
     /**

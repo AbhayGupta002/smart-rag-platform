@@ -277,7 +277,7 @@ public class RagGenerationService {
         if (relevanceFilter.isConversationalQuery(normQuery)) {
             String conversationalReply = relevanceFilter.getConversationalResponse(normQuery);
             metricsTracker.recordSuccess(System.currentTimeMillis() - startTime);
-            return new RagAnswer(query, conversationalReply, List.of(), 0);
+            return new RagAnswer(query, cleanAnswerFormatting(conversationalReply), List.of(), 0);
         }
 
         // 1. Check L1 / L2 Distributed Cache First
@@ -369,8 +369,10 @@ public class RagGenerationService {
                     previewText
             ));
 
-            contextBuilder.append(String.format("[%d] Document: %s | Page: %d | Section: %s\n%s\n\n",
-                    i + 1, docLabel, res.page(), res.heading() != null ? res.heading() : "", rawText));
+            String cleanedChunk = relevanceFilter.stripOutlineAndHeaderArtifacts(rawText);
+            if (!cleanedChunk.isBlank()) {
+                contextBuilder.append("---\n").append(cleanedChunk).append("\n\n");
+            }
         }
 
         // Generate comprehensive answer via Free LLM Chain with graceful Extractive Fallback
@@ -382,6 +384,8 @@ public class RagGenerationService {
         if (answer == null || answer.isBlank()) {
             answer = relevanceFilter.synthesizeExtractiveAnswer(query, cleanResults);
         }
+
+        answer = cleanAnswerFormatting(answer);
 
         return new RagAnswer(query, answer, citations, cleanResults.size());
     }
@@ -483,7 +487,7 @@ public class RagGenerationService {
             Map<String, Object> body = Map.of(
                     "model", model,
                     "messages", List.of(
-                            Map.of("role", "system", "content", "You are an intelligent, articulate enterprise document AI assistant. Provide thorough, well-structured, and clear explanations in natural language based on the provided document context."),
+                            Map.of("role", "system", "content", "You are an intelligent, articulate enterprise AI document assistant. Deeply analyze the user's query and provide a comprehensive, natural, and helpful explanation. Strict formatting rule: NEVER use asterisks (* or **), NEVER include page numbers, and NEVER include chunk or reference numbers."),
                             Map.of("role", "user", "content", prompt)
                     ),
                     "temperature", 0.3,
@@ -568,7 +572,7 @@ public class RagGenerationService {
             Map<String, Object> body = Map.of(
                     "model", model,
                     "messages", List.of(
-                            Map.of("role", "system", "content", "You are an intelligent enterprise document AI assistant."),
+                            Map.of("role", "system", "content", "You are an intelligent, articulate enterprise AI document assistant. Deeply analyze the user's query and provide a comprehensive, natural, and helpful explanation. Strict formatting rule: NEVER use asterisks (* or **), NEVER include page numbers, and NEVER include chunk or reference numbers."),
                             Map.of("role", "user", "content", prompt)
                     ),
                     "temperature", 0.3,
@@ -727,14 +731,67 @@ public class RagGenerationService {
     private String buildSystemPrompt(String query, String context) {
         return "You are an intelligent, articulate enterprise AI document assistant.\n\n" +
                 "The user is asking: \"" + query + "\"\n\n" +
-                "INSTRUCTIONS:\n" +
-                "1. Provide a comprehensive, well-structured, and clear explanation answering the user's question in natural language based on the provided document context.\n" +
-                "2. Synthesize facts into a natural narrative with an introductory overview, well-explained paragraphs, and organized bullet points for key details.\n" +
-                "3. Ground all factual statements in the provided context. Cite relevant document names or pages where appropriate.\n" +
-                "4. Do NOT output raw OCR junk, outline codes, or fragmented notes.\n" +
-                "5. Present a polished, professional response that fully explains the topic to the user.\n\n" +
+                "INSTRUCTIONS FOR YOUR RESPONSE:\n" +
+                "1. ANALYZE USER QUERY & INTENT: Deeply understand what the user wants to know. When the user asks 'tell me about X' or asks an open-ended question, provide a comprehensive, well-structured, and insightful explanation synthesizing all relevant history, key figures, governance, geography, concepts, and factual details from the context.\n" +
+                "2. NATURAL EXPLANATION: Write fluent, cohesive paragraphs and organized plain bullet points. Explain concepts clearly and professionally as a knowledgeable expert.\n" +
+                "3. STRICT FORMATTING RULES (CRITICAL):\n" +
+                "   - Do NOT use asterisks (*) or markdown bold (**) anywhere in the response. Output strictly plain readable text.\n" +
+                "   - Do NOT include any page numbers (e.g. never write 'Page 8', 'p. 20', '(Page 15)', etc.).\n" +
+                "   - Do NOT include chunk numbers, bracketed numbers, or index references (e.g. never write '[1]', 'Chunk 1', or '[2]').\n" +
+                "   - Do NOT mention document filenames, PDF titles, or source paths.\n" +
+                "   - Do NOT output raw OCR junk, scanner phone numbers, or outline codes.\n" +
+                "   - For bullet points, start lines with '• ' followed by plain text without bolding.\n\n" +
                 "DOCUMENT CONTEXT:\n" + context + "\n\n" +
-                "DETAILED EXPLANATION:";
+                "DETAILED EXPLANATION (Plain text, no asterisks, no page or chunk numbers):";
+    }
+
+    /**
+     * Cleans and sanitizes answer text ensuring no asterisks (* or **), page numbers,
+     * chunk brackets, outline noise, or publisher watermarks leak to the user.
+     */
+    public String cleanAnswerFormatting(String answer) {
+        if (answer == null || answer.isBlank()) return "";
+
+        String cleaned = answer;
+
+        // 1. Remove all markdown bold and italic asterisks
+        cleaned = cleaned.replaceAll("\\*{1,}", "");
+
+        // 2. Remove markdown header hashes: ### Heading -> Heading
+        cleaned = cleaned.replaceAll("(?m)^\\s*#{1,6}\\s*", "");
+
+        // 3. Remove chunk references: [1], [2], [1, 2], [Chunk 1], Chunk 1, chunk 2
+        cleaned = cleaned.replaceAll("\\[\\s*\\d+\\s*(?:,\\s*\\d+\\s*)*\\]", "");
+        cleaned = cleaned.replaceAll("(?i)\\[?\\bchunk\\s*\\d+\\b\\]?", "");
+
+        // 4. Remove page references: (Page 8), (Page 8-10), Page 8, p. 8, (p. 20), (Pages 12-15)
+        cleaned = cleaned.replaceAll("(?i)\\(?\\s*\\b(?:pages?|p\\.)\\s*\\d+(?:\\s*[-–—to]+\\s*\\d+)?\\s*\\)?", "");
+
+        // 5. Remove source/document references: "Source: ...", "**Source: ...**", "Document: ..."
+        cleaned = cleaned.replaceAll("(?im)^\\s*(?:source|document|ref|reference):\\s*[^\\r\\n]+", "");
+
+        // 6. Remove exam/syllabus outline headers: "PAPER - I", "PAPER-II", "Section-A", "Section-B"
+        cleaned = cleaned.replaceAll("(?i)\\b(?:PAPER|Paper)\\s*[-–—]?\\s*[I|V0-9]+", "");
+        cleaned = cleaned.replaceAll("(?i)\\b(?:Section|SECTION)\\s*[-–—]?\\s*[A-Z0-9]+", "");
+
+        // 7. Remove OCR junk / publisher watermarks: e.g. "ToppersNotes / 9828-286-909 5"
+        cleaned = cleaned.replaceAll("(?i)T\\s*oppersNotes[^\\r\\n]*", "");
+        cleaned = cleaned.replaceAll("\\b\\d{4,5}[-\\s]?\\d{3}[-\\s]?\\d{3,4}\\b", "");
+
+        // 8. Standardize bullet points: "- ", "* " -> "• "
+        cleaned = cleaned.replaceAll("(?m)^\\s*[-*]\\s+", "• ");
+
+        // 9. Clean up empty parentheses left behind: "()", "( )"
+        cleaned = cleaned.replaceAll("\\(\\s*\\)", "");
+        cleaned = cleaned.replaceAll("\\s+,", ",");
+        cleaned = cleaned.replaceAll("\\s+\\.", ".");
+
+        // 10. Clean up multiple empty lines or dangling spaces
+        cleaned = cleaned.replaceAll("[ \\t]+", " ");
+        cleaned = cleaned.replaceAll("(\\r?\\n){3,}", "\n\n");
+        cleaned = cleaned.replaceAll("(?m)^[ \\t]+", "");
+
+        return cleaned.trim();
     }
 
     public record Citation(String document, int page, String heading, double similarityScore, String preview) {}

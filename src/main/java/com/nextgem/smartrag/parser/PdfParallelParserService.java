@@ -2,7 +2,7 @@ package com.nextgem.smartrag.parser;
 
 import com.nextgem.smartrag.config.RagPipelineProperties;
 import com.nextgem.smartrag.model.DocumentJob;
-import com.nextgem.smartrag.repository.DocumentJobRepository;
+import com.nextgem.smartrag.repository.DocumentRepository;
 import com.nextgem.smartrag.service.CheckpointService;
 import com.nextgem.smartrag.service.DynamicHardwareTuningService;
 import com.nextgem.smartrag.service.ResourceManager;
@@ -40,7 +40,7 @@ public class PdfParallelParserService {
     private final RagPipelineProperties properties;
     private final ExecutorService executor;
     private final DynamicHardwareTuningService tuningService;
-    private final DocumentJobRepository documentJobRepository;
+    private final DocumentRepository documentRepository;
     private final PageBatchProcessor pageBatchProcessor;
     private final CheckpointService checkpointService;
     private final ResourceManager resourceManager;
@@ -55,7 +55,7 @@ public class PdfParallelParserService {
             RagPipelineProperties properties,
             @Qualifier("pipelineExecutor") ExecutorService executor,
             DynamicHardwareTuningService tuningService,
-            DocumentJobRepository documentJobRepository,
+            DocumentRepository documentRepository,
             PageBatchProcessor pageBatchProcessor,
             CheckpointService checkpointService,
             ResourceManager resourceManager
@@ -63,7 +63,7 @@ public class PdfParallelParserService {
         this.properties = properties;
         this.executor = executor;
         this.tuningService = tuningService;
-        this.documentJobRepository = documentJobRepository;
+        this.documentRepository = documentRepository;
         this.pageBatchProcessor = pageBatchProcessor;
         this.checkpointService = checkpointService;
         this.resourceManager = resourceManager;

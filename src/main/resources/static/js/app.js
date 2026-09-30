@@ -75,8 +75,8 @@ async function submitQuestion() {
         let citationsHtml = '';
         if (data.citations && data.citations.length > 0) {
             citationsHtml = '<div class="citation-list">' + data.citations.map(c => `
-                <span class="citation-tag" title="${escapeHtml(c.preview)}">
-                    📄 ${escapeHtml(c.document)} (p.${c.page}) &bull; [${escapeHtml(c.heading)}] &bull; ${Math.round(c.similarityScore * 100)}%
+                <span class="citation-tag" title="Page ${c.page} - ${escapeHtml(c.preview)}">
+                    📚 ${escapeHtml(c.document)} &bull; ${Math.round(c.similarityScore * 100)}% Match
                 </span>
             `).join('') + '</div>';
         }

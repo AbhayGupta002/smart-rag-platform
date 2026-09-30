@@ -1,7 +1,7 @@
 package com.nextgem.smartrag.service;
 
 import com.nextgem.smartrag.model.DocumentJob;
-import com.nextgem.smartrag.repository.DocumentJobRepository;
+import com.nextgem.smartrag.repository.DocumentRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -9,7 +9,6 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -23,11 +22,11 @@ public class CheckpointService {
 
     private static final Logger log = LoggerFactory.getLogger(CheckpointService.class);
 
-    private final DocumentJobRepository documentJobRepository;
+    private final DocumentRepository documentRepository;
     private final AtomicReference<String> activePipelineRunId = new AtomicReference<>();
 
-    public CheckpointService(DocumentJobRepository documentJobRepository) {
-        this.documentJobRepository = documentJobRepository;
+    public CheckpointService(DocumentRepository documentRepository) {
+        this.documentRepository = documentRepository;
     }
 
     /**
@@ -63,7 +62,7 @@ public class CheckpointService {
         String safeChecksum = (checksum != null && !checksum.isBlank()) ? checksum : "unknown_" + filename;
         String runId = getActiveRunId();
 
-        DocumentJob job = documentJobRepository.findByChecksum(safeChecksum)
+        DocumentJob job = documentRepository.findByChecksum(safeChecksum)
                 .orElseGet(() -> {
                     DocumentJob fresh = new DocumentJob();
                     fresh.setFilename(filename);
@@ -88,12 +87,12 @@ public class CheckpointService {
             job.setCompletedAt(LocalDateTime.now());
         }
 
-        return documentJobRepository.save(job);
+        return documentRepository.save(job);
     }
 
     @Transactional
     public void markCompleted(String checksum, int totalPages, int chunks, long elapsedMs) {
-        documentJobRepository.findByChecksum(checksum).ifPresent(job -> {
+        documentRepository.findByChecksum(checksum).ifPresent(job -> {
             job.setJobStatus(DocumentJob.JobStatus.COMPLETED);
             job.setTotalPages(totalPages);
             job.setProcessedPages(totalPages);
@@ -103,18 +102,18 @@ public class CheckpointService {
             job.setCompletedAt(LocalDateTime.now());
             job.setErrorMessage(null);
             job.setFailureReason(null);
-            documentJobRepository.save(job);
+            documentRepository.save(job);
         });
     }
 
     @Transactional
     public void markFailed(String checksum, String errorMessage) {
-        documentJobRepository.findByChecksum(checksum).ifPresent(job -> {
+        documentRepository.findByChecksum(checksum).ifPresent(job -> {
             job.setJobStatus(DocumentJob.JobStatus.FAILED);
             job.setErrorMessage(errorMessage);
             job.setFailureReason(errorMessage);
             job.setCompletedAt(LocalDateTime.now());
-            documentJobRepository.save(job);
+            documentRepository.save(job);
         });
     }
 
@@ -123,7 +122,7 @@ public class CheckpointService {
      */
     public boolean isAlreadyCompleted(String checksum) {
         if (checksum == null) return false;
-        return documentJobRepository.findByChecksum(checksum)
+        return documentRepository.findByChecksum(checksum)
                 .map(job -> job.getJobStatus() == DocumentJob.JobStatus.COMPLETED || "SUCCESS".equalsIgnoreCase(job.getStatus()))
                 .orElse(false);
     }
@@ -132,7 +131,7 @@ public class CheckpointService {
      * Retrieves all incomplete or failed documents eligible for resumption.
      */
     public List<DocumentJob> findResumableJobs() {
-        return documentJobRepository.findByJobStatusIn(List.of(
+        return documentRepository.findByJobStatusIn(List.of(
                 DocumentJob.JobStatus.DISCOVERED,
                 DocumentJob.JobStatus.VALIDATED,
                 DocumentJob.JobStatus.PROCESSING,
@@ -143,6 +142,6 @@ public class CheckpointService {
     }
 
     public List<DocumentJob> getJobsByRunId(String runId) {
-        return documentJobRepository.findByPipelineRunId(runId);
+        return documentRepository.findByPipelineRunId(runId);
     }
 }

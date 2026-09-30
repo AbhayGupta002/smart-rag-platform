@@ -310,6 +310,16 @@ public class QueryRelevanceFilter {
         // Strip remaining inline outline markers like "# 1", "# 16."
         cleaned = cleaned.replaceAll("#\\s*\\d+(\\.\\d+)*", "");
 
+        // Strip page mentions and numbers: "(Page 8)", "Page 8", "p. 20"
+        cleaned = cleaned.replaceAll("(?i)\\(?\\s*\\b(?:pages?|p\\.)\\s*\\d+(?:\\s*[-–—to]+\\s*\\d+)?\\s*\\)?", "");
+
+        // Strip publisher watermarks and phone numbers (e.g. "ToppersNotes / 9828-286-909 5")
+        cleaned = cleaned.replaceAll("(?i)T\\s*oppersNotes[^\\r\\n]*", "");
+        cleaned = cleaned.replaceAll("\\b\\d{4,5}[-\\s]?\\d{3}[-\\s]?\\d{3,4}\\b", "");
+
+        // Strip markdown bold and italic asterisks
+        cleaned = cleaned.replaceAll("\\*{1,}", "");
+
         return cleaned.trim();
     }
 
@@ -377,8 +387,8 @@ public class QueryRelevanceFilter {
         // Pre-defined high-level overviews for common topics if relevant
         String primaryOverview = null;
         String lowerQ = (query != null) ? query.toLowerCase() : "";
-        if (lowerQ.contains("history") && lowerQ.contains("madhya")) {
-            primaryOverview = "The ancient history of Madhya Pradesh spans prehistoric times, the Stone Age, Bronze Age settlements, Vedic kingdoms, and prominent dynasties including the Mauryas and Guptas.";
+        if (lowerQ.contains("madhya") || lowerQ.contains("madhyapradesh")) {
+            primaryOverview = "Madhya Pradesh is located in central India with an extensive history spanning prehistoric settlements, ancient empires including the Mauryas and Guptas, medieval kingdoms, and significant cultural landmarks.";
         } else if (lowerQ.contains("frontend") && lowerQ.contains("optimi")) {
             primaryOverview = "Frontend Optimization & Security Guide provides a practical reference for eliminating dead code, improving runtime performance, and securing frontend applications.";
         }
@@ -475,7 +485,7 @@ public class QueryRelevanceFilter {
         // 2. Structured concept points (if genuine concepts found)
         if (!conceptDefinitions.isEmpty()) {
             for (Map.Entry<String, String> entry : conceptDefinitions.entrySet()) {
-                sb.append("• **").append(entry.getKey()).append("**: ").append(entry.getValue()).append("\n");
+                sb.append("• ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
             }
         }
 
@@ -559,6 +569,8 @@ public class QueryRelevanceFilter {
         if (lower.startsWith("volume -") || s.contains("9828-286-909") || s.equals("CHAPTER")
                 || lower.startsWith("frontend optimization & security guide")
                 || lower.startsWith("answers must be written in")
+                || lower.matches("(?i).*\\bpages?\\s*\\d+.*")
+                || lower.matches("(?i).*\\bp\\.\\s*\\d+.*")
                 || s.endsWith(":")) {
             return false;
         }
@@ -604,7 +616,7 @@ public class QueryRelevanceFilter {
             // Skip code lines, page numbers or noise
             if (trimmed.length() < 25 || trimmed.startsWith("#") || trimmed.startsWith("import ") ||
                     trimmed.startsWith("try:") || trimmed.startsWith("print(") || trimmed.startsWith("except") ||
-                    trimmed.toLowerCase().startsWith("page ") || trimmed.toLowerCase().startsWith("## page ") ||
+                    trimmed.matches("(?i).*\\bpages?\\s*\\d+.*") || trimmed.matches("(?i).*\\bp\\.\\s*\\d+.*") ||
                     trimmed.contains(" = ") || trimmed.startsWith("def ") || trimmed.startsWith("return ") ||
                     trimmed.contains("os.path") || trimmed.contains("uuid.") ||
                     trimmed.toLowerCase().contains("chapter title page") ||
@@ -630,6 +642,30 @@ public class QueryRelevanceFilter {
                 if (salient.size() >= 3) break;
             }
         }
+
+        // If no direct keyword match in sentences but chunk was retrieved as relevant, include top clean sentences
+        if (salient.isEmpty()) {
+            for (String sentence : sentences) {
+                String trimmed = sentence.replaceAll("\\s+", " ").trim();
+                if (trimmed.length() < 25 || trimmed.startsWith("#") || trimmed.startsWith("import ") ||
+                        trimmed.matches("(?i).*\\bpages?\\s*\\d+.*") || trimmed.matches("(?i).*\\bp\\.\\s*\\d+.*") ||
+                        trimmed.toLowerCase().contains("chapter title page")) {
+                    continue;
+                }
+                trimmed = trimmed.replaceAll("^\\s*\\d+(\\.\\d+)*[:.)-]\\s*", "")
+                        .replaceAll("^\\s*\\(\\s*[a-zA-Z0-9]+\\s*\\)\\s*", "")
+                        .replaceAll("^\\s*[a-zA-Z0-9]+\\)\\s*", "")
+                        .trim();
+                if (trimmed.length() >= 20) {
+                    if (!trimmed.endsWith(".") && !trimmed.endsWith("!") && !trimmed.endsWith("?")) {
+                        trimmed += ".";
+                    }
+                    salient.add(trimmed);
+                    if (salient.size() >= 2) break;
+                }
+            }
+        }
+
         return salient;
     }
 

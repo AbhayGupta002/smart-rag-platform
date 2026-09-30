@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.Optional;
 
 @Repository
-public interface DocumentJobRepository extends JpaRepository<DocumentJob, Long> {
+public interface DocumentRepository extends JpaRepository<DocumentJob, Long> {
     Optional<DocumentJob> findByChecksum(String checksum);
     boolean existsByChecksumAndStatus(String checksum, String status);
     List<DocumentJob> findByPipelineRunId(String pipelineRunId);

@@ -144,4 +144,57 @@ public class QueryPipelineOptimizationTest {
         assertNotNull(cachedEmb);
         assertEquals(0.2f, cachedEmb[1]);
     }
+
+    @Test
+    void testCleanAnswerFormattingStripsAsterisksPageNumbersAndChunkArtifacts() {
+        RagGenerationService genService = new RagGenerationService(null, cacheService, relevanceFilter, concurrencyGuard, circuitBreaker, metricsTracker, objectMapper);
+
+        String rawLlmResponse = "Source: Volume-1-History-Geography-Politics-and-Economy-of-Madhya-Pradesh (Page 8)\n" +
+                "**Ashoka**: Ashoka was one of the greatest rulers. Kakaniya (Page 8).\n" +
+                "[1] Chunk 1: Ashoka married Shridevi/Mahadevi of Besnagar (Vidisha) (p. 20).\n" +
+                "• **Dynasties**: Sunga and Maurya dynasties ruled central India.\n" +
+                "ToppersNotes / 9828-286-909 5";
+
+        String cleaned = genService.cleanAnswerFormatting(rawLlmResponse);
+
+        assertFalse(cleaned.contains("**"), "Must not contain markdown bold asterisks");
+        assertFalse(cleaned.contains("* *"), "Must not contain isolated asterisks");
+        assertFalse(cleaned.contains("*"), "Must not contain any asterisks");
+        assertFalse(cleaned.contains("Page 8"), "Must not contain page references");
+        assertFalse(cleaned.contains("p. 20"), "Must not contain page abbreviations");
+        assertFalse(cleaned.contains("[1]"), "Must not contain bracketed chunk numbers");
+        assertFalse(cleaned.contains("Chunk 1"), "Must not contain chunk identifiers");
+        assertFalse(cleaned.contains("ToppersNotes"), "Must not contain publisher watermarks");
+        assertFalse(cleaned.contains("9828-286-909"), "Must not contain phone numbers");
+        assertTrue(cleaned.contains("Ashoka was one of the greatest rulers"));
+        assertTrue(cleaned.contains("• Dynasties: Sunga and Maurya dynasties ruled central India."));
+    }
+
+    @Test
+    void testSynthesizeExtractiveAnswerContainsNoAsterisksOrPageNumbers() {
+        ChromaVectorStoreService.SearchResult res1 = new ChromaVectorStoreService.SearchResult(
+                "chk_mp_1",
+                "Volume-1-History-Geography-Politics-and-Economy-of-Madhya-Pradesh",
+                8,
+                "CHAPTER",
+                "Ashoka was a prominent ruler. Ashoka married Shridevi of Besnagar. Sanchi Stupa was restored between 1912 and 1920 CE.",
+                0.85,
+                List.of("Volume-1:p8")
+        );
+
+        String answer = relevanceFilter.synthesizeExtractiveAnswer("tell me about madhyapradesh", List.of(res1));
+
+        assertFalse(answer.contains("**"), "Extractive answer must not contain markdown bold asterisks");
+        assertFalse(answer.contains("* *"), "Extractive answer must not contain asterisks");
+        assertFalse(answer.contains("Page 8"), "Extractive answer must not contain page numbers");
+        assertFalse(answer.contains("(Page 8)"), "Extractive answer must not contain bracketed page numbers");
+        assertTrue(answer.contains("Madhya Pradesh is located in central India"), "Should include synthesized foundational overview");
+        assertTrue(answer.contains("Ashoka married Shridevi of Besnagar") || answer.contains("Sanchi Stupa"));
+    }
+
+    @Test
+    void testQueryNormalizationForMadhyaPradesh() {
+        String normalized = relevanceFilter.normalizeAndExpandQuery("tell me about madhyapradesh");
+        assertEquals("tell me about madhya pradesh", normalized);
+    }
 }

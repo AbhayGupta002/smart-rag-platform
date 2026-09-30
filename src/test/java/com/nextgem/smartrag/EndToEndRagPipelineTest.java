@@ -2,7 +2,7 @@ package com.nextgem.smartrag;
 
 import com.nextgem.smartrag.model.DocumentJob;
 import com.nextgem.smartrag.orchestrator.RagPipelineOrchestrator;
-import com.nextgem.smartrag.repository.DocumentJobRepository;
+import com.nextgem.smartrag.repository.DocumentRepository;
 import com.nextgem.smartrag.service.RagGenerationService;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
@@ -33,7 +33,7 @@ public class EndToEndRagPipelineTest {
     private RagGenerationService generationService;
 
     @Autowired
-    private DocumentJobRepository jobRepository;
+    private DocumentRepository jobRepository;
 
     private Path testDir;
 
