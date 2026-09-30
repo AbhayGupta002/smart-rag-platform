@@ -185,7 +185,7 @@ public class ChromaVectorStoreService {
                 JsonNode root = objectMapper.readTree(getResp.body());
                 this.chromaCollectionId = root.path("id").asText();
                 log.info("[CHROMA] Connected to existing collection: {} (ID: {})", properties.getChromaCollection(), chromaCollectionId);
-                syncDiskVectorsToChroma();
+                CompletableFuture.runAsync(this::syncDiskVectorsToChroma, executor);
                 return;
             }
 
@@ -206,7 +206,7 @@ public class ChromaVectorStoreService {
                 JsonNode root = objectMapper.readTree(response.body());
                 this.chromaCollectionId = root.path("id").asText();
                 log.info("[CHROMA] Created active collection: {} (ID: {})", properties.getChromaCollection(), chromaCollectionId);
-                syncDiskVectorsToChroma();
+                CompletableFuture.runAsync(this::syncDiskVectorsToChroma, executor);
             }
         } catch (Exception e) {
             log.warn("[CHROMA] Failed creating/accessing collection: {}", e.getMessage());
@@ -573,12 +573,10 @@ public class ChromaVectorStoreService {
             }
         }
 
-        // 2. Complement with streaming disk scan to guarantee complete document coverage
-        List<SearchResult> diskResults = streamSearchFromDisk(queryEmbedding, queryText, safeK * 4);
-        for (SearchResult dr : diskResults) {
-            if (candidates.stream().noneMatch(c -> c.id().equals(dr.id()))) {
-                candidates.add(dr);
-            }
+        // 2. Only fallback to disk scan if ChromaDB is offline or returned no results
+        if (candidates.isEmpty()) {
+            List<SearchResult> diskResults = streamSearchFromDisk(queryEmbedding, queryText, safeK * 4);
+            candidates.addAll(diskResults);
         }
 
         // 3. Hybrid Lexical + Semantic Re-ranking

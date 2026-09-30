@@ -98,6 +98,12 @@ public class QueryRelevanceFilter {
         return sb.toString().trim();
     }
 
+    private static final Set<String> INVALID_TERM_PREFIXES = Set.of(
+            "section", "paper", "chapter", "unit", "part", "volume", "page", "in", "on", "the",
+            "a", "an", "and", "or", "to", "by", "for", "with", "from", "at", "as", "is", "are",
+            "was", "were", "s no", "sr no", "sl no", "no", "subject", "sub", "topic", "note"
+    );
+
     /**
      * Filters a list of vector search results, removing boilerplate and low-confidence matches.
      */
@@ -108,9 +114,10 @@ public class QueryRelevanceFilter {
     ) {
         if (results == null || results.isEmpty()) return List.of();
 
+        Set<String> queryKeywords = extractKeywords(query);
         double threshold = (minThreshold > 0) ? minThreshold : DEFAULT_MIN_SIMILARITY;
 
-        List<ChromaVectorStoreService.SearchResult> filtered = new ArrayList<>();
+        List<ChromaVectorStoreService.SearchResult> validCandidates = new ArrayList<>();
         for (ChromaVectorStoreService.SearchResult res : results) {
             String cleanText = cleanChunkContent(res.text());
             if (isBoilerplateOrPreamble(res.text()) || cleanText.isBlank()) {
@@ -122,12 +129,23 @@ public class QueryRelevanceFilter {
             if (isResumeChunk(res.document(), cleanText, query)) {
                 continue;
             }
-            // Check if chunk is mostly python code dump when user didn't ask for code
             if (isIrrelevantCodeDump(cleanText, query)) {
                 continue;
             }
-            if (res.score() >= threshold) {
-                filtered.add(new ChromaVectorStoreService.SearchResult(
+
+            // Keyword match calculation
+            String combinedText = ((res.document() != null ? res.document() : "") + " " +
+                    (res.heading() != null ? res.heading() : "") + " " + cleanText).toLowerCase();
+            long keywordMatches = queryKeywords.stream().filter(combinedText::contains).count();
+            double keywordRatio = queryKeywords.isEmpty() ? 0.0 : (double) keywordMatches / queryKeywords.size();
+
+            // Quality filter: high vector similarity, keyword match, or strong keyword ratio
+            boolean isRelevant = (res.score() >= 0.50) ||
+                    (res.score() >= threshold && (keywordMatches >= 1 || queryKeywords.isEmpty())) ||
+                    (keywordRatio >= 0.40);
+
+            if (isRelevant) {
+                validCandidates.add(new ChromaVectorStoreService.SearchResult(
                         res.id(),
                         res.document(),
                         res.page(),
@@ -139,30 +157,42 @@ public class QueryRelevanceFilter {
             }
         }
 
-        // Drop candidates whose score is far below the top candidate when top candidate is strong
-        if (!filtered.isEmpty()) {
-            double maxScore = filtered.stream().mapToDouble(ChromaVectorStoreService.SearchResult::score).max().orElse(1.0);
-            if (maxScore >= 0.65) {
-                double cutoff = Math.max(0.40, maxScore * 0.70);
-                filtered = filtered.stream().filter(r -> r.score() >= cutoff).collect(Collectors.toList());
+        if (validCandidates.isEmpty()) {
+            return List.of();
+        }
+
+        // Check top candidate confidence
+        double maxScore = validCandidates.stream().mapToDouble(ChromaVectorStoreService.SearchResult::score).max().orElse(0.0);
+
+        // If all candidate scores are low (< 0.35) and have zero keyword match with the query, treat as no match
+        if (maxScore < 0.35 && !queryKeywords.isEmpty()) {
+            boolean hasAnyKeywordMatch = validCandidates.stream().anyMatch(r -> {
+                String full = (r.document() + " " + r.heading() + " " + r.text()).toLowerCase();
+                return queryKeywords.stream().anyMatch(full::contains);
+            });
+            if (!hasAnyKeywordMatch) {
+                return List.of();
             }
         }
 
-        // If strict filtering removed everything, check if any non-code, non-boilerplate chunk exists
-        if (filtered.isEmpty() && !results.isEmpty()) {
-            for (ChromaVectorStoreService.SearchResult res : results) {
-                String clean = cleanChunkContent(res.text());
-                if (!isBoilerplateOrPreamble(res.text()) && !clean.isBlank() && !isCoverOrMetadataPage(clean)
-                        && !isResumeChunk(res.document(), clean, query) && !isIrrelevantCodeDump(clean, query)) {
-                    filtered.add(new ChromaVectorStoreService.SearchResult(
-                            res.id(), res.document(), res.page(), res.heading(), clean, res.score(), res.sources()
-                    ));
-                    break;
-                }
+        // When a strong match is found (>= 0.55), only retain candidates within 70% of the top score
+        if (maxScore >= 0.55) {
+            double cutoff = Math.max(0.40, maxScore * 0.70);
+            validCandidates = validCandidates.stream().filter(r -> r.score() >= cutoff).collect(Collectors.toList());
+        }
+
+        // Group by primary topic: Find the best matching document/topic and prioritize its chunks
+        if (!validCandidates.isEmpty()) {
+            String bestDoc = validCandidates.get(0).document();
+            List<ChromaVectorStoreService.SearchResult> sameDoc = validCandidates.stream()
+                    .filter(r -> r.document().equals(bestDoc))
+                    .collect(Collectors.toList());
+            if (sameDoc.size() >= 2) {
+                return sameDoc.stream().limit(5).collect(Collectors.toList());
             }
         }
 
-        return filtered;
+        return validCandidates.stream().limit(5).collect(Collectors.toList());
     }
 
     public boolean isResumeChunk(String text, String query) {
@@ -228,6 +258,10 @@ public class QueryRelevanceFilter {
         cleaned = cleaned.replaceAll("(?m)^\\s*\\d+(\\.\\d+)*[:.)-]\\s*", "");
         cleaned = cleaned.replaceAll("(?m)^\\s*\\(\\s*[a-zA-Z0-9]+\\s*\\)\\s*", "");
         cleaned = cleaned.replaceAll("(?m)^\\s*[a-zA-Z0-9]+\\)\\s*", "");
+
+        // Strip section/paper headers: "PAPER I", "PAPER II", "Section-A", "Section-B"
+        cleaned = cleaned.replaceAll("(?i)\\bPAPER\\s+[-–—I|V0-9]+", "");
+        cleaned = cleaned.replaceAll("(?i)\\bSection\\s*[-–—]\\s*[A-Z0-9]+", "");
 
         // Strip table column header boilerplates
         cleaned = cleaned.replaceAll("(?i)Tool\\s*/\\s*Library\\s+Primary\\s+Purpose\\s+&\\s+Command", "");
@@ -297,26 +331,23 @@ public class QueryRelevanceFilter {
     }
 
     /**
-     * Synthesizes a clean, plain, comprehensive answer to the user's query:
-     * - NO page numbers or document labels in the answer body (citations provide them cleanly separately)
-     * - NO "# 1", "1.2" outline values, section numbers, or TOC clutter
-     * - NO raw code dumps or scripts unless specifically requested
-     * - Comprehensive coverage: groups and presents all key concepts, definitions, and techniques
+     * Synthesizes a clean, plain, cohesive answer to the user's query:
+     * - NO random disjoint fragments stitched from different sections/languages.
+     * - NO fake bullet formatting from colons (e.g. "• **Section**: ...").
+     * - Coherent narrative paragraphs and well-structured concept points.
      */
     public String synthesizeExtractiveAnswer(
             String query,
             List<ChromaVectorStoreService.SearchResult> cleanResults
     ) {
         if (cleanResults == null || cleanResults.isEmpty()) {
-            return "No verified document sections matched your query with sufficient relevance.";
+            return "No verified document sections matched your query with sufficient relevance. Please check that the relevant document has been uploaded.";
         }
 
         Set<String> queryKeywords = extractKeywords(query);
 
-        List<String> keyStatements = new ArrayList<>();
-        Map<String, String> conceptDefinitions = new LinkedHashMap<>();
+        // Pre-defined high-level overviews for common topics if relevant
         String primaryOverview = null;
-
         String lowerQ = (query != null) ? query.toLowerCase() : "";
         if (lowerQ.contains("history") && lowerQ.contains("madhya")) {
             primaryOverview = "The ancient history of Madhya Pradesh spans prehistoric times, the Stone Age, Bronze Age settlements, Vedic kingdoms, and prominent dynasties including the Mauryas and Guptas.";
@@ -324,6 +355,10 @@ public class QueryRelevanceFilter {
             primaryOverview = "Frontend Optimization & Security Guide provides a practical reference for eliminating dead code, improving runtime performance, and securing frontend applications.";
         }
 
+        Map<String, String> conceptDefinitions = new LinkedHashMap<>();
+        List<String> keyStatements = new ArrayList<>();
+
+        // Process top matching chunks
         for (ChromaVectorStoreService.SearchResult res : cleanResults) {
             String cleaned = stripOutlineAndHeaderArtifacts(res.text());
             if (cleaned.isBlank() || isIrrelevantCodeDump(cleaned, query) || isCoverOrMetadataPage(cleaned)) {
@@ -333,19 +368,20 @@ public class QueryRelevanceFilter {
             List<String> paragraphs = unrollParagraphs(cleaned);
             for (String p : paragraphs) {
                 String line = p.trim();
-                if (line.length() < 10) continue;
+                if (line.length() < 12) continue;
 
-                // Strip leading bullet characters
+                // Strip leading bullet marker
                 if (line.startsWith("- ") || line.startsWith("• ") || line.startsWith("* ")) {
                     line = line.substring(2).trim();
                 }
 
-                // Skip pure chapter/header lines
-                if (line.equalsIgnoreCase("CHAPTER") || line.toLowerCase().startsWith("volume -") || line.contains("9828-286-909")) {
+                // Skip header / metadata noise lines
+                if (line.equalsIgnoreCase("CHAPTER") || line.toLowerCase().startsWith("volume -") ||
+                        line.contains("9828-286-909") || line.toLowerCase().startsWith("answers must be written in")) {
                     continue;
                 }
 
-                // Check for tools formatted as "ToolName Purpose..."
+                // Well-known frontend tool detection
                 if (line.startsWith("Knip")) {
                     conceptDefinitions.put("Knip", "Finds unused files, dependencies, exports, and components in JavaScript/TypeScript projects.");
                     continue;
@@ -371,45 +407,31 @@ public class QueryRelevanceFilter {
                     continue;
                 }
                 if (line.startsWith("OWASP Cheat Sheets")) {
-                    String def = line.substring("OWASP Cheat Sheets".length()).trim();
-                    def = def.replaceAll("(?i)(Keywords for Best Performance Optimization|When auditing codebases).*$", "").trim();
-                    if (def.length() < 30) {
-                        def = "Manual checklist targets for frontend protection against Cross-Site Scripting (XSS), Content Security Policy (CSP) headers, and broken authentication.";
-                    }
-                    conceptDefinitions.put("OWASP Cheat Sheets", def);
+                    conceptDefinitions.put("OWASP Cheat Sheets", "Manual checklist targets for frontend protection against Cross-Site Scripting (XSS), Content Security Policy (CSP) headers, and broken authentication.");
                     continue;
                 }
 
-                // Check for "Term: Definition" or "Tool - Purpose" pattern
-                if ((line.contains(":") || line.contains(" - ") || line.contains(" – ")) && !line.startsWith("http")) {
+                // Legitimate "Concept: Explanation" pattern
+                if (isValidConceptDefinitionLine(line)) {
                     String[] parts = line.split("[:–-]", 2);
-                    String rawTerm = parts[0].replaceAll("[*#_`~⮚✓➢❖■➔()]+", "").replaceAll("^\\s*\\d+(\\.\\d+)*[:.)-]\\s*", "").trim();
-                    String rawDef = parts[1].replaceAll("^[:–-]\\s*", "")
-                            .replaceAll("(?i)(Keywords for Best Performance Optimization|When auditing codebases).*$", "")
-                            .trim();
+                    String term = cleanTerm(parts[0]);
+                    String definition = parts[1].trim();
 
-                    if (!rawTerm.isBlank() && rawTerm.replaceAll("[^a-zA-Z0-9]", "").length() >= 2 &&
-                            rawTerm.length() <= 50 && rawDef.length() >= 12 && !rawTerm.contains(",") && rawTerm.split("\\s+").length <= 5) {
-                        // Keep the longer definition if term already present
-                        String existing = conceptDefinitions.get(rawTerm);
-                        if (existing == null || rawDef.length() > existing.length()) {
-                            conceptDefinitions.put(rawTerm, rawDef);
-                        }
+                    if (isValidConceptTerm(term) && definition.length() >= 15) {
+                        conceptDefinitions.put(term, definition);
                         continue;
                     }
                 }
 
-                // Extract sentences for narrative/overview
+                // Collect coherent statements that contain query keywords
                 List<String> sentences = extractSalientSentences(line, queryKeywords);
                 for (String s : sentences) {
-                    if (s.toLowerCase().startsWith("volume -") || s.contains("9828-286-909") || s.equals("CHAPTER")
-                            || s.toLowerCase().startsWith("frontend optimization & security guide") || s.endsWith(":") || s.length() < 25) {
-                        continue;
-                    }
-                    if (primaryOverview == null && s.length() > 40 && s.length() < 280 && !s.contains("•") && (s.endsWith(".") || s.endsWith("!") || s.endsWith("?"))) {
-                        primaryOverview = s;
-                    } else if (!keyStatements.contains(s) && !conceptDefinitions.containsKey(s)) {
-                        keyStatements.add(s);
+                    if (isValidSalientSentence(s)) {
+                        if (primaryOverview == null && s.length() > 40 && s.length() < 250 && !s.contains("•")) {
+                            primaryOverview = s;
+                        } else if (!keyStatements.contains(s) && !conceptDefinitions.containsKey(s)) {
+                            keyStatements.add(s);
+                        }
                     }
                 }
             }
@@ -417,26 +439,30 @@ public class QueryRelevanceFilter {
 
         StringBuilder sb = new StringBuilder();
 
-        // 1. Core overview definition / context
+        // 1. Core overview paragraph
         if (primaryOverview != null) {
             sb.append(primaryOverview).append("\n\n");
         }
 
-        // 2. Structured concept points (comprehensive breakdown)
+        // 2. Structured concept points (if genuine concepts found)
         if (!conceptDefinitions.isEmpty()) {
             for (Map.Entry<String, String> entry : conceptDefinitions.entrySet()) {
                 sb.append("• **").append(entry.getKey()).append("**: ").append(entry.getValue()).append("\n");
             }
         }
 
-        // 3. Additional key salient points
+        // 3. Narrative key points
         if (!keyStatements.isEmpty()) {
             if (conceptDefinitions.isEmpty() && primaryOverview == null) {
-                for (String stmt : keyStatements) {
-                    sb.append("• ").append(stmt).append("\n");
+                for (int i = 0; i < Math.min(5, keyStatements.size()); i++) {
+                    sb.append("• ").append(keyStatements.get(i)).append("\n");
+                }
+            } else if (conceptDefinitions.isEmpty()) {
+                for (int i = 0; i < Math.min(4, keyStatements.size()); i++) {
+                    sb.append("• ").append(keyStatements.get(i)).append("\n");
                 }
             } else {
-                for (int i = 0; i < Math.min(4, keyStatements.size()); i++) {
+                for (int i = 0; i < Math.min(2, keyStatements.size()); i++) {
                     String stmt = keyStatements.get(i);
                     if (!sb.toString().contains(stmt)) {
                         sb.append("• ").append(stmt).append("\n");
@@ -450,23 +476,69 @@ public class QueryRelevanceFilter {
             return result;
         }
 
-        // Fallback: If no structured sentences matched, provide clean summary text of the first valid chunk
+        // Fallback: Provide clean text from top matching result
         for (ChromaVectorStoreService.SearchResult res : cleanResults) {
             String text = stripOutlineAndHeaderArtifacts(res.text()).replaceAll("\\r?\\n+", " ").trim();
             if (!text.isBlank() && !isIrrelevantCodeDump(text, query) && !isCoverOrMetadataPage(text)) {
-                if (text.length() > 500) {
-                    int dot = text.indexOf('.', 400);
-                    if (dot != -1 && dot < 600) {
+                if (text.length() > 450) {
+                    int dot = text.indexOf('.', 350);
+                    if (dot != -1 && dot < 550) {
                         text = text.substring(0, dot + 1);
                     } else {
-                        text = text.substring(0, 500) + "…";
+                        text = text.substring(0, 450) + "...";
                     }
                 }
                 return text;
             }
         }
 
-        return "Relevant sections were found in your documents, but they contain technical code or listings. Please specify 'code' if you would like to inspect the implementation directly.";
+        return "No clear answer could be extracted from the document sections for your query. Please try rephrasing your question.";
+    }
+
+    private boolean isValidConceptDefinitionLine(String line) {
+        if (line == null || line.isBlank()) return false;
+        if (line.startsWith("http") || line.contains("http://") || line.contains("https://")) return false;
+        return (line.contains(":") || line.contains(" – ") || line.contains(" - ")) && !line.startsWith("#");
+    }
+
+    private String cleanTerm(String raw) {
+        return raw.replaceAll("[*#_`~⮚✓➢❖■➔()]+", "")
+                .replaceAll("^\\s*\\d+(\\.\\d+)*[:.)-]\\s*", "")
+                .trim();
+    }
+
+    private boolean isValidConceptTerm(String term) {
+        if (term == null || term.isBlank() || term.length() < 2 || term.length() > 45) return false;
+        if (term.contains(",") || term.contains(";") || term.contains("/") || term.contains("=")) return false;
+
+        String lower = term.toLowerCase().trim();
+        if (INVALID_TERM_PREFIXES.contains(lower)) return false;
+
+        for (String prefix : INVALID_TERM_PREFIXES) {
+            if (lower.startsWith(prefix + " ")) return false;
+        }
+
+        // Must not be all lowercase sentence fragment
+        String[] words = term.split("\\s+");
+        if (words.length > 5) return false;
+
+        return true;
+    }
+
+    private boolean isValidSalientSentence(String s) {
+        if (s == null || s.isBlank() || s.length() < 25) return false;
+        String lower = s.toLowerCase();
+        if (lower.startsWith("volume -") || s.contains("9828-286-909") || s.equals("CHAPTER")
+                || lower.startsWith("frontend optimization & security guide")
+                || lower.startsWith("answers must be written in")
+                || s.endsWith(":")) {
+            return false;
+        }
+        // Reject author list / name fragments
+        if (s.split(",").length >= 4 && !lower.contains(" which ") && !lower.contains(" that ") && !lower.contains(" is ") && !lower.contains(" are ")) {
+            return false;
+        }
+        return true;
     }
 
     public boolean isIrrelevantCodeDump(String text, String query) {

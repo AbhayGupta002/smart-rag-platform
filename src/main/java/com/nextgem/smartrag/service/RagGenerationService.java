@@ -136,7 +136,7 @@ public class RagGenerationService {
                 }
             });
 
-            RagAnswer answer = future.get(12, TimeUnit.SECONDS);
+            RagAnswer answer = future.get(15, TimeUnit.SECONDS);
             // Cache computed answer
             cacheService.putAnswer(normQuery, safeK, answer);
             metricsTracker.recordSuccess(System.currentTimeMillis() - startTime);
@@ -146,13 +146,18 @@ public class RagGenerationService {
             throw e;
         } catch (Exception e) {
             metricsTracker.recordFailure(System.currentTimeMillis() - startTime);
-            log.error("[RAG-QA] Query execution failed for '{}': {}", normQuery, e.getMessage());
-            return new RagAnswer(
-                    normQuery,
-                    "An error occurred while synthesizing your answer under heavy load: " + e.getMessage(),
-                    List.of(),
-                    0
-            );
+            Throwable cause = (e instanceof ExecutionException && e.getCause() != null) ? e.getCause() : e;
+            log.error("[RAG-QA] Query execution failed for '{}': {}", normQuery, cause.getMessage(), cause);
+            try {
+                return doAskInternal(normQuery, safeK);
+            } catch (Exception fallbackEx) {
+                return new RagAnswer(
+                        normQuery,
+                        "We encountered an issue processing your query under current system load. Please try again in a few moments.",
+                        List.of(),
+                        0
+                );
+            }
         }
     }
 
@@ -183,9 +188,10 @@ public class RagGenerationService {
             ChromaVectorStoreService.SearchResult res = cleanResults.get(i);
             String docLabel = (res.sources() != null && res.sources().size() > 1)
                     ? res.document() + " (also in: " + String.join(", ", res.sources()) + ")"
-                    : res.document();
+                    : (res.document() != null ? res.document() : "document");
 
-            String previewText = res.text().replaceAll("\\s+", " ").trim();
+            String rawText = (res.text() != null) ? res.text() : "";
+            String previewText = rawText.replaceAll("\\s+", " ").trim();
             if (previewText.length() > 250) {
                 previewText = previewText.substring(0, 250) + "...";
             }
@@ -193,22 +199,23 @@ public class RagGenerationService {
             citations.add(new Citation(
                     docLabel,
                     res.page(),
-                    res.heading(),
+                    res.heading() != null ? res.heading() : "",
                     res.score(),
                     previewText
             ));
 
             contextBuilder.append(String.format("[%d] Document: %s | Page: %d | Section: %s\n%s\n\n",
-                    i + 1, docLabel, res.page(), res.heading(), res.text()));
+                    i + 1, docLabel, res.page(), res.heading() != null ? res.heading() : "", rawText));
         }
 
-        String answer;
+        String answer = null;
         if (geminiApiKey != null && !geminiApiKey.isBlank() && circuitBreaker.allowExecution()) {
-            answer = callGeminiLlm(query, contextBuilder.toString());
+            answer = callGeminiLlm(query, contextBuilder.toString(), cleanResults);
         } else if (circuitBreaker.allowExecution()) {
             answer = callOllamaOrFallback(query, contextBuilder.toString(), cleanResults);
-        } else {
-            // Circuit Breaker OPEN -> Fast Extractive Fallback
+        }
+
+        if (answer == null || answer.isBlank()) {
             answer = relevanceFilter.synthesizeExtractiveAnswer(query, cleanResults);
         }
 
@@ -256,7 +263,7 @@ public class RagGenerationService {
         });
     }
 
-    private String callGeminiLlm(String query, String context) {
+    private String callGeminiLlm(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {
         try {
             String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + geminiApiKey;
             String prompt = buildSystemPrompt(query, context);
@@ -276,7 +283,10 @@ public class RagGenerationService {
             if (resp.statusCode() == 200) {
                 circuitBreaker.recordSuccess();
                 JsonNode root = objectMapper.readTree(resp.body());
-                return root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText();
+                String text = root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText();
+                if (text != null && !text.isBlank()) {
+                    return text;
+                }
             } else {
                 circuitBreaker.recordFailure();
                 log.warn("Gemini API call returned status: {}", resp.statusCode());
@@ -285,7 +295,7 @@ public class RagGenerationService {
             circuitBreaker.recordFailure();
             log.warn("Gemini API call failed: {}", e.getMessage());
         }
-        return "Grounded Answer based on retrieved records:\n\n" + context;
+        return relevanceFilter.synthesizeExtractiveAnswer(query, results);
     }
 
     private String callOllamaOrFallback(String query, String context, List<ChromaVectorStoreService.SearchResult> results) {

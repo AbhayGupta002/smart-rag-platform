@@ -28,13 +28,12 @@ spring:
       max-file-size: 500MB
       max-request-size: 2GB
   datasource:
-    url: jdbc:h2:file:./data/pipeline_db;DB_CLOSE_DELAY=-1
+    url: jdbc:h2:file:./data/pipeline_db;DB_CLOSE_DELAY=-1;AUTO_SERVER=TRUE
     driver-class-name: org.h2.Driver
     username: sa
     password: ""
   jpa:
     open-in-view: false
-    database-platform: org.hibernate.dialect.H2Dialect
     hibernate:
       ddl-auto: update
   h2:
@@ -72,7 +71,7 @@ rag:
 
     # RAG Chunking Parameters
     chunk-size: 1200
-    chunk-overlap: 150
+    chunk-overlap: 50
 
     # Chroma Vector Database Settings
     chroma-url: "${CHROMA_URL:http://localhost:8005}"
